@@ -1,20 +1,110 @@
 @import 'tailwindcss';
-/* Design tokens (Tailwind v4 @theme). Single source of truth — utility
-   classes like `bg-brand-500` resolve to these CSS variables. */
+
+/* Enable class-based dark mode: `dark:` variants apply when an ancestor
+   (typically <html>) carries the `dark` class. */
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* ------------------------------------------------------------------ *
+ * Design tokens (Tailwind v4 @theme).
+ *
+ * Static brand / status hues live here directly. Semantic surface and
+ * text tokens point at runtime CSS variables (declared in :root / .dark
+ * below) so the same utility class — e.g. `bg-surface` — resolves to a
+ * light value by default and a dark value under `.dark`.
+ * ------------------------------------------------------------------ */
 @theme {
-  --color-brand-50: #eff6ff;
-  --color-brand-100: #dbeafe;
-  --color-brand-500: #3b82f6;
-  --color-brand-600: #2563eb;
-  --color-brand-700: #1d4ed8;
+  /* Accent — single indigo hue, used sparingly. */
+  --color-accent-50: #eef2ff;
+  --color-accent-100: #e0e7ff;
+  --color-accent-400: #818cf8;
+  --color-accent-500: #6366f1;
+  --color-accent-600: #4f46e5;
+  --color-accent-700: #4338ca;
+
+  /* Back-compat: existing components still reference `brand-*`. Alias to accent. */
+  --color-brand-50: #eef2ff;
+  --color-brand-100: #e0e7ff;
+  --color-brand-500: #6366f1;
+  --color-brand-600: #4f46e5;
+  --color-brand-700: #4338ca;
+
+  /* Status hues (used as soft tints via /10 /20 opacity utilities). */
+  --color-status-todo: #6b7280;
+  --color-status-progress: #f59e0b;
+  --color-status-done: #10b981;
+  --color-status-blocked: #ef4444;
+
   --color-danger-500: #ef4444;
   --color-success-500: #10b981;
   --color-warning-500: #f59e0b;
+
+  /* Semantic tokens — resolve to the runtime variables below. */
+  --color-surface: var(--surface);
+  --color-surface-raised: var(--surface-raised);
+  --color-surface-overlay: var(--surface-overlay);
+  --color-border-subtle: var(--border-subtle);
+  --color-border-strong: var(--border-strong);
+  --color-content: var(--content);
+  --color-content-secondary: var(--content-secondary);
+  --color-content-muted: var(--content-muted);
+
   --font-sans: 'Inter', ui-sans-serif, system-ui, sans-serif;
 }
-html, body, #root { height: 100%; }
+
+/* Light theme (default). */
+:root {
+  --surface: #f6f7f9;
+  --surface-raised: #ffffff;
+  --surface-overlay: #ffffff;
+  --border-subtle: rgba(15, 15, 17, 0.08);
+  --border-strong: rgba(15, 15, 17, 0.14);
+  --content: #18181b;
+  --content-secondary: #52525b;
+  --content-muted: #a1a1aa;
+  color-scheme: light;
+}
+
+/* Dark theme — Linear-style muted surfaces. */
+.dark {
+  --surface: #0f0f11;
+  --surface-raised: #161618;
+  --surface-overlay: #1c1c1f;
+  --border-subtle: rgba(255, 255, 255, 0.07);
+  --border-strong: rgba(255, 255, 255, 0.12);
+  --content: #f0f0f0;
+  --content-secondary: #8c8c8c;
+  --content-muted: #525252;
+  color-scheme: dark;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
 body {
-  background-color: #f9fafb;
-  color: #111827;
+  background-color: var(--surface);
+  color: var(--content);
   font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* Shared entrance animation for popovers / dialogs:
+   scale(0.97) -> scale(1) + fade, 120ms, no spring. */
+@keyframes popover-in {
+  from {
+    opacity: 0;
+    transform: scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+.animate-popover-in {
+  animation: popover-in 120ms ease-out;
+  transform-origin: var(--popover-origin, top center);
 }

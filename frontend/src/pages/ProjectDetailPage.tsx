@@ -92,8 +92,8 @@ export function ProjectDetailPage() {
     }
   };
 
-  if (error && !project) return <p className="text-sm text-red-600">{error}</p>;
-  if (!project) return <p className="text-sm text-gray-500">Loading…</p>;
+  if (error && !project) return <p className="text-sm text-status-blocked">{error}</p>;
+  if (!project) return <p className="text-sm text-content-secondary">Loading…</p>;
 
   // Mirrors backend authorisation in projects-service `_delete`: admin can
   // delete anything; a team_lead can delete only projects they own. We hide
@@ -109,8 +109,8 @@ export function ProjectDetailPage() {
     <section className="space-y-4">
       <header className="flex flex-wrap items-start justify-between gap-2">
         <div>
-          <h1 className="text-xl font-semibold">{project.name}</h1>
-          <p className="text-sm text-gray-600">Status: {project.status}</p>
+          <h1 className="text-xl font-semibold tracking-[-0.02em] text-content">{project.name}</h1>
+          <p className="text-sm text-content-secondary">Status: {project.status}</p>
         </div>
         {canDelete && !confirmOpen && (
           <button
@@ -120,7 +120,7 @@ export function ProjectDetailPage() {
               setConfirmText('');
               setError(null);
             }}
-            className="rounded border border-red-300 px-3 py-1.5 text-sm text-red-700 hover:bg-red-50"
+            className="rounded-md border border-status-blocked/30 px-3 py-1.5 text-sm text-status-blocked transition-colors duration-150 hover:bg-status-blocked/10"
           >
             Delete project
           </button>
@@ -188,7 +188,7 @@ export function ProjectDetailPage() {
         </div>
       )}
 
-      <div role="tablist" aria-label="Project sections" onKeyDown={handleTabKey} className="flex gap-1 border-b border-gray-200">
+      <div role="tablist" aria-label="Project sections" onKeyDown={handleTabKey} className="flex gap-1 border-b border-border-subtle">
         {TABS.map((tab) => {
           const selected = tab.key === activeTab;
           return (
@@ -199,7 +199,7 @@ export function ProjectDetailPage() {
               aria-selected={selected}
               tabIndex={selected ? 0 : -1}
               onClick={() => setActiveTab(tab.key)}
-              className={`px-3 py-2 text-sm ${selected ? 'border-b-2 border-brand-600 text-brand-700' : 'text-gray-600 hover:text-gray-900'}`}
+              className={`px-3 py-2 text-sm transition-colors duration-150 ${selected ? 'border-b-2 border-accent-500 text-content' : 'text-content-secondary hover:text-content'}`}
             >
               {tab.label}
             </button>
@@ -207,13 +207,13 @@ export function ProjectDetailPage() {
         })}
       </div>
 
-      <div role="tabpanel" className="rounded border border-gray-200 bg-white p-4 text-sm">
+      <div role="tabpanel" className="rounded-lg border border-border-subtle bg-surface-raised p-4 text-sm text-content">
         {activeTab === 'overview' && (
           <dl className="grid grid-cols-1 gap-2 md:grid-cols-2">
-            <div><dt className="text-gray-500">Description</dt><dd>{project.description || '—'}</dd></div>
-            <div><dt className="text-gray-500">Start</dt><dd>{project.start_date ?? '—'}</dd></div>
-            <div><dt className="text-gray-500">Target end</dt><dd>{project.target_end_date ?? '—'}</dd></div>
-            <div><dt className="text-gray-500">Actual end</dt><dd>{project.actual_end_date ?? '—'}</dd></div>
+            <div><dt className="text-content-secondary">Description</dt><dd>{project.description || '—'}</dd></div>
+            <div><dt className="text-content-secondary">Start</dt><dd>{project.start_date ?? '—'}</dd></div>
+            <div><dt className="text-content-secondary">Target end</dt><dd>{project.target_end_date ?? '—'}</dd></div>
+            <div><dt className="text-content-secondary">Actual end</dt><dd>{project.actual_end_date ?? '—'}</dd></div>
           </dl>
         )}
         {activeTab === 'deliverables' && <DeliverablesPanel projectId={project.id} />}

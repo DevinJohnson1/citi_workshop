@@ -7,6 +7,25 @@ import {
   type SessionRole,
   type WorkshopSession,
 } from '../auth/session';
+import { useTheme } from '../utils/theme';
+import { MoonIcon, SunIcon } from './ui/icons';
+
+/** Header control that flips between light and dark themes. */
+function ThemeToggle() {
+  const { theme, toggle } = useTheme();
+  const isDark = theme === 'dark';
+  return (
+    <button
+      type="button"
+      onClick={toggle}
+      aria-label={isDark ? 'Switch to light theme' : 'Switch to dark theme'}
+      title={isDark ? 'Switch to light theme' : 'Switch to dark theme'}
+      className="inline-flex h-8 w-8 items-center justify-center rounded-md border border-border-subtle text-content-secondary transition-colors duration-150 hover:bg-white/5 hover:text-content"
+    >
+      {isDark ? <SunIcon size={16} /> : <MoonIcon size={16} />}
+    </button>
+  );
+}
 
 interface Props {
   children: ReactNode;
@@ -64,10 +83,10 @@ export function AppShell({ children }: Props) {
     : [];
 
   return (
-    <div className="min-h-full flex flex-col">
-      <header className="border-b border-gray-200 bg-white">
+    <div className="min-h-full flex flex-col bg-surface text-content">
+      <header className="border-b border-border-subtle bg-surface-raised">
         <div className="mx-auto max-w-6xl px-4 py-3 flex flex-col md:flex-row md:items-center md:justify-between gap-2">
-          <Link to="/" className="text-lg font-semibold text-brand-700">
+          <Link to="/" className="text-base font-semibold tracking-[-0.02em] text-content">
             ACME Project Tracker
           </Link>
           <nav aria-label="Primary" className="flex flex-wrap gap-x-4 gap-y-1 text-sm">
@@ -76,18 +95,21 @@ export function AppShell({ children }: Props) {
                 key={item.to}
                 to={item.to}
                 className={({ isActive }) =>
-                  isActive ? 'text-brand-700 font-medium' : 'text-gray-600 hover:text-gray-900'
+                  isActive
+                    ? 'text-accent-400 font-medium'
+                    : 'text-content-secondary hover:text-content transition-colors duration-150'
                 }
               >
                 {item.label}
               </NavLink>
             ))}
           </nav>
-          <div className="text-sm text-gray-600">
+          <div className="flex items-center gap-2 text-sm text-content-secondary">
+            <ThemeToggle />
             {session ? (
               <div className="flex items-center gap-2">
                 <span
-                  className="rounded bg-brand-50 px-2 py-0.5 text-xs font-medium text-brand-700"
+                  className="rounded-md bg-accent-500/10 px-2 py-0.5 text-xs font-medium text-accent-400"
                   aria-label={`Signed in as ${session.role}`}
                 >
                   {session.role}
@@ -95,7 +117,7 @@ export function AppShell({ children }: Props) {
                 <button
                   type="button"
                   onClick={handleSignOut}
-                  className="rounded border border-gray-300 px-3 py-1 hover:bg-gray-50"
+                  className="rounded-md border border-border-subtle px-3 py-1 text-content-secondary transition-colors duration-150 hover:bg-white/5 hover:text-content"
                 >
                   Sign out ({session.email || 'user'})
                 </button>
@@ -103,7 +125,7 @@ export function AppShell({ children }: Props) {
             ) : (
               <Link
                 to="/login"
-                className="rounded border border-gray-300 px-3 py-1 hover:bg-gray-50"
+                className="rounded-md border border-border-subtle px-3 py-1 transition-colors duration-150 hover:bg-white/5 hover:text-content"
               >
                 Sign in
               </Link>
@@ -112,7 +134,7 @@ export function AppShell({ children }: Props) {
         </div>
       </header>
       <main className="mx-auto w-full max-w-6xl flex-1 px-4 py-6">{children}</main>
-      <footer className="border-t border-gray-200 bg-white text-xs text-gray-500">
+      <footer className="border-t border-border-subtle bg-surface-raised text-xs text-content-muted">
         <div className="mx-auto max-w-6xl px-4 py-3">v1.1 · SYSTEM_DESIGN-aligned</div>
       </footer>
     </div>

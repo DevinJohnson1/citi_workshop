@@ -3,6 +3,11 @@ import { createRoot } from 'react-dom/client';
 import './index.css';
 import { App } from './App';
 import { ConditionalAuthProvider } from './auth/ConditionalAuthProvider';
+import { initThemeClass } from './utils/theme';
+
+// Apply the persisted (or OS-preferred) theme before first paint to avoid
+// a light-to-dark flash on load.
+initThemeClass();
 
 const rootEl = document.getElementById('root');
 if (!rootEl) {

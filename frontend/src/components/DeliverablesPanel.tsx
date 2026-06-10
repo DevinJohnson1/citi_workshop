@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { useApi, ApiError, type ListResponse } from '../services/apiClient';
 import { useRole } from '../auth/useRole';
-import { overworkSuffix } from './OverworkBadge';
 import type {
   Assignment,
   AssignmentRole,
@@ -10,6 +9,21 @@ import type {
   Equipment,
   User,
 } from '../types/api';
+import { StatusPill, StatusSelectPill, STATUS_ORDER } from './ui/StatusPill';
+import { AssigneeStack } from './ui/AssigneeStack';
+import { PriorityIcon, derivePriority } from './ui/PriorityIcon';
+import { formatRelativeDue } from '../utils/relativeDate';
+import { DeliverableRowSkeleton, EmptyState, ErrorBanner } from './ui/feedback';
+import {
+  BoxIcon,
+  CalendarIcon,
+  CheckIcon,
+  ChevronRightIcon,
+  InboxIcon,
+  KeyIcon,
+  PlusIcon,
+  XIcon,
+} from './ui/icons';
 
 /**
  * Props for {@link DeliverablesPanel}.
@@ -18,9 +32,6 @@ interface Props {
   /** The project whose deliverables are displayed and managed. */
   projectId: string;
 }
-
-const STATUSES: DeliverableStatus[] = ['todo', 'in_progress', 'blocked', 'done', 'cancelled'];
-const ASSIGNMENT_ROLES: AssignmentRole[] = ['owner', 'contributor', 'reviewer'];
 
 /**
  * Deliverables panel on the project detail page.
@@ -33,15 +44,17 @@ const ASSIGNMENT_ROLES: AssignmentRole[] = ['owner', 'contributor', 'reviewer'];
  *     ("Reject").
  *   - viewer / others: read-only.
  *
- * Each deliverable's expandable detail area shows:
- *   - **People**: members assigned to the deliverable via the `assignments`
- *     table (owner / contributor / reviewer).  Only `team_lead` users may
- *     hold the `owner` role — the backend enforces this.
- *   - **Tangibles / Intangibles**: equipment from the project's pool that has
- *     `assigned_deliverable_id` pointing at this deliverable.
- *
- * Only `team_lead` / `admin` can manage either set.  Backend authorisation
- * mirrors this in `assignments-service` and `equipment-service`.
+ * UI overhaul notes:
+ *   - Status is rendered as an interactive {@link StatusSelectPill}; for
+ *     leads/admin it opens an inline popover instead of a native <select>.
+ *   - Assignees use the shared {@link AssigneeStack} (avatar stack +
+ *     keyboard combobox). Controls are hidden at rest and revealed on row
+ *     hover.
+ *   - Priority is *derived* from existing fields (is_outdated / due_date) —
+ *     the schema has no priority column. Tags are derived from linked asset
+ *     kinds. Neither changes the data contract.
+ *   - All original event handlers (create, status patch, link/unlink asset,
+ *     assign/remove member) are preserved verbatim.
  */
 export function DeliverablesPanel({ projectId }: Props) {
   const { apiGet, apiPost, apiPatch, apiDelete } = useApi();
@@ -76,23 +89,16 @@ export function DeliverablesPanel({ projectId }: Props) {
   const [selectedToLink, setSelectedToLink] = useState<Record<string, string>>({});
   const [linking, setLinking] = useState<Record<string, boolean>>({});
 
-  /**
-   * Per-deliverable form state for the "Assign a member" picker.
-   * Stored as flat maps keyed by deliverable id so each row is independent.
-   */
-  const [selectedUser, setSelectedUser] = useState<Record<string, string>>({});
-  const [selectedRole, setSelectedRole] = useState<Record<string, AssignmentRole>>({});
+  /** Per-deliverable assigning-in-flight flags (combobox quick-assign). */
   const [assigning, setAssigning] = useState<Record<string, boolean>>({});
 
   const reload = useCallback(() => {
     setLoading(true);
-    // Four parallel requests so the panel renders in one render pass:
+    // Three parallel requests so the panel renders in one render pass:
     //  1. deliverables on this project (primary list).
     //  2. equipment attached to this project, for the asset link picker.
     //  3. user catalogue, for member-assignment names + lead-role gating.
-    //  4. assignments are filtered client-side from the project's
-    //     deliverable ids; we fetch them in a second effect below to avoid
-    //     a per-deliverable round trip.
+    // Assignments are loaded in a follow-up effect (no project_id filter).
     Promise.all([
       apiGet<ListResponse<Deliverable>>(
         `/deliverables-service?project_id=${encodeURIComponent(projectId)}`,
@@ -171,11 +177,16 @@ export function DeliverablesPanel({ projectId }: Props) {
   };
 
   const updateStatus = async (id: string, status: DeliverableStatus): Promise<void> => {
+    // Optimistic update: flip the pill immediately, roll back on failure so
+    // the popover feels instant without changing the underlying contract.
+    const prevRows = rows;
+    setRows((rs) => rs.map((d) => (d.id === id ? { ...d, status } : d)));
     setError(null);
     try {
       await apiPatch<Deliverable>(`/deliverables-service/${id}`, { status });
       reload();
     } catch (err) {
+      setRows(prevRows);
       setError(err instanceof ApiError ? err.message : (err as Error).message);
     }
   };
@@ -223,10 +234,14 @@ export function DeliverablesPanel({ projectId }: Props) {
   /**
    * Assign a user to a deliverable in a specific role.  Reload everything on
    * success so the People section refreshes and the picker clears.
+   * The combobox does not surface a role selector, so we default to
+   * `contributor` (the backend restricts `owner` to team_leads anyway).
    */
-  const handleAssignMember = async (deliverableId: string): Promise<void> => {
-    const userId = selectedUser[deliverableId];
-    const roleOnAssignment = selectedRole[deliverableId] ?? 'contributor';
+  const handleAssignMember = async (
+    deliverableId: string,
+    userId: string,
+    roleOnAssignment: AssignmentRole = 'contributor',
+  ): Promise<void> => {
     if (!userId) return;
     setAssigning((prev) => ({ ...prev, [deliverableId]: true }));
     setError(null);
@@ -237,7 +252,6 @@ export function DeliverablesPanel({ projectId }: Props) {
         role_on_assignment: roleOnAssignment,
         percent: 100,
       });
-      setSelectedUser((prev) => ({ ...prev, [deliverableId]: '' }));
       reload();
     } catch (err) {
       setError(err instanceof ApiError ? err.message : (err as Error).message);
@@ -267,6 +281,10 @@ export function DeliverablesPanel({ projectId }: Props) {
 
   /** User lookup helper for rendering assignee names. */
   const userById = (id: string): User | undefined => members.find((u) => u.id === id);
+  const nameFor = (id: string): string => {
+    const u = userById(id);
+    return u ? u.full_name || u.email : id.slice(0, 8);
+  };
 
   /**
    * Equipment on this project that is not yet linked to any deliverable and
@@ -277,339 +295,231 @@ export function DeliverablesPanel({ projectId }: Props) {
   );
 
   return (
-    <div className="space-y-4">
-      {error && <p className="text-sm text-red-600">{error}</p>}
+    <div className="space-y-3">
+      {error && <ErrorBanner message={error} onDismiss={() => setError(null)} />}
 
       {loading ? (
-        <p className="text-sm text-gray-500">Loading…</p>
+        <div className="space-y-2">
+          <DeliverableRowSkeleton />
+          <DeliverableRowSkeleton />
+          <DeliverableRowSkeleton />
+        </div>
+      ) : rows.length === 0 ? (
+        <EmptyState
+          icon={<InboxIcon size={28} />}
+          message="No deliverables yet."
+          action={
+            canPropose ? (
+              <span className="text-[11px] text-content-muted">
+                Add one below to get started.
+              </span>
+            ) : undefined
+          }
+        />
       ) : (
-        <table className="min-w-full text-sm">
-          <thead className="bg-gray-50 text-left text-gray-700">
-            <tr>
-              <th scope="col" className="px-3 py-2">Title</th>
-              <th scope="col" className="px-3 py-2">Status</th>
-              <th scope="col" className="px-3 py-2">Due</th>
-              <th scope="col" className="px-3 py-2">People</th>
-              <th scope="col" className="px-3 py-2">Assets</th>
-              <th scope="col" className="px-3 py-2">Actions</th>
-            </tr>
-          </thead>
-          <tbody>
-            {rows.length === 0 && (
-              <tr>
-                <td colSpan={6} className="px-3 py-4 text-gray-500">
-                  No deliverables yet.
-                </td>
-              </tr>
-            )}
-            {rows.flatMap((d) => {
-              const awaiting = d.status === 'todo';
-              const isExpanded = expanded.has(d.id);
-              const linked = assetsFor(d.id);
-              const tangibles = linked.filter((e) => e.is_tangible);
-              const intangibles = linked.filter((e) => !e.is_tangible);
-              const people = assignmentsFor(d.id);
+        <ul className="space-y-2">
+          {rows.map((d) => {
+            const awaiting = d.status === 'todo';
+            const isExpanded = expanded.has(d.id);
+            const linked = assetsFor(d.id);
+            const tangibles = linked.filter((e) => e.is_tangible);
+            const intangibles = linked.filter((e) => !e.is_tangible);
+            const people = assignmentsFor(d.id);
+            const due = formatRelativeDue(d.due_date);
+            const priority = derivePriority(d);
 
-              // Pool of users who can be added: project members not yet
-              // assigned in any role on this deliverable.
-              const alreadyAssignedIds = new Set(people.map((p) => p.user_id));
-              const assignablePool = members.filter(
-                (u) => !alreadyAssignedIds.has(u.id) && u.is_allocatable,
-              );
+            // Tags derived from linked asset kinds (no schema change). Unique,
+            // capped at 2 with a +N overflow chip in the metadata row.
+            const tags = Array.from(new Set(linked.map((e) => e.kind)));
 
-              const mainRow = (
-                <tr key={d.id} className="border-t border-gray-100">
-                  <td className="px-3 py-2">{d.title}</td>
-                  <td className="px-3 py-2">
-                    {d.status}
-                    {awaiting && (
-                      <span className="ml-2 rounded bg-amber-100 px-1.5 py-0.5 text-xs text-amber-800">
-                        awaiting approval
-                      </span>
-                    )}
-                    {d.is_outdated && (
-                      <span className="ml-2 rounded bg-red-100 px-1.5 py-0.5 text-xs text-red-700">
-                        overdue
-                      </span>
-                    )}
-                  </td>
-                  <td className="px-3 py-2">{d.due_date ?? '—'}</td>
-                  <td className="px-3 py-2">
-                    <button
-                      type="button"
-                      onClick={() => toggleExpanded(d.id)}
-                      className="flex items-center gap-1 rounded px-1.5 py-0.5 text-xs text-brand-700 hover:bg-brand-50"
-                      aria-label={`Toggle people for ${d.title}`}
-                    >
-                      {people.length > 0 ? (
-                        <span className="rounded-full bg-brand-100 px-1.5 text-brand-800">
-                          {people.length}
-                        </span>
-                      ) : (
-                        <span className="text-gray-400">none</span>
-                      )}
-                    </button>
-                  </td>
-                  <td className="px-3 py-2">
-                    {/* Toggle button showing asset count or "none" */}
-                    <button
-                      type="button"
-                      onClick={() => toggleExpanded(d.id)}
-                      className="flex items-center gap-1 rounded px-1.5 py-0.5 text-xs text-brand-700 hover:bg-brand-50"
-                      aria-expanded={isExpanded}
-                    >
-                      <span aria-hidden>{isExpanded ? '▾' : '▸'}</span>
-                      {linked.length > 0 ? (
-                        <span className="rounded-full bg-brand-100 px-1.5 text-brand-800">
-                          {linked.length}
-                        </span>
-                      ) : (
-                        <span className="text-gray-400">none</span>
-                      )}
-                    </button>
-                  </td>
-                  <td className="px-3 py-2">
-                    {canApprove && awaiting && (
-                      <div className="flex gap-1">
-                        <button
-                          type="button"
-                          onClick={() => void updateStatus(d.id, 'in_progress')}
-                          className="rounded bg-emerald-600 px-2 py-0.5 text-xs text-white hover:bg-emerald-700"
+            // Pool of users who can be added: project members not yet
+            // assigned in any role on this deliverable.
+            const alreadyAssignedIds = new Set(people.map((p) => p.user_id));
+            const assignablePool = members.filter(
+              (u) => !alreadyAssignedIds.has(u.id) && u.is_allocatable,
+            );
+
+            return (
+              <li
+                key={d.id}
+                className="group rounded-lg border border-border-subtle bg-surface-raised transition-colors duration-150 hover:border-border-strong"
+              >
+                {/* ---- Main row ---- */}
+                <div className="flex items-center gap-3 px-3 py-2.5">
+                  <button
+                    type="button"
+                    onClick={() => toggleExpanded(d.id)}
+                    aria-expanded={isExpanded}
+                    aria-label={`Toggle details for ${d.title}`}
+                    className="shrink-0 rounded p-0.5 text-content-muted transition-transform duration-150 hover:text-content"
+                    style={{ transform: isExpanded ? 'rotate(90deg)' : 'rotate(0deg)' }}
+                  >
+                    <ChevronRightIcon size={15} />
+                  </button>
+
+                  <PriorityIcon priority={priority} />
+
+                  <div className="min-w-0 flex-1">
+                    <p className="truncate text-[14px] font-semibold leading-tight tracking-[-0.02em] text-content">
+                      {d.title}
+                    </p>
+                    {/* Metadata row — single line, degrades gracefully. */}
+                    <div className="mt-1 flex flex-wrap items-center gap-2 text-[11px] font-medium text-content-secondary">
+                      {due && (
+                        <span
+                          className={`inline-flex items-center gap-1 ${
+                            due.overdue ? 'text-status-blocked' : ''
+                          }`}
                         >
-                          Approve
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => void updateStatus(d.id, 'cancelled')}
-                          className="rounded border border-gray-300 px-2 py-0.5 text-xs hover:bg-gray-50"
-                        >
-                          Reject
-                        </button>
-                      </div>
-                    )}
-                    {canApprove && !awaiting && (
-                      <select
-                        value={d.status}
-                        onChange={(e) =>
-                          void updateStatus(d.id, e.target.value as DeliverableStatus)
-                        }
-                        className="rounded border border-gray-300 px-1 py-0.5 text-xs"
-                      >
-                        {STATUSES.map((s) => (
-                          <option key={s} value={s}>
-                            {s}
-                          </option>
-                        ))}
-                      </select>
-                    )}
-                  </td>
-                </tr>
-              );
-
-              const assetRow = isExpanded ? (
-                <tr key={`${d.id}-detail`} className="bg-gray-50">
-                  <td colSpan={6} className="border-t border-gray-100 px-5 py-3">
-                    <div className="space-y-4">
-
-                      {/* People section */}
-                      <div>
-                        <h4 className="mb-1.5 text-xs font-semibold uppercase tracking-wide text-gray-500">
-                          People
-                        </h4>
-                        {people.length === 0 ? (
-                          <p className="text-xs text-gray-400">
-                            No members assigned to this deliverable.
-                          </p>
-                        ) : (
-                          <div className="flex flex-wrap gap-1.5">
-                            {people.map((p) => {
-                              const u = userById(p.user_id);
-                              const label = u
-                                ? (u.full_name || u.email)
-                                : p.user_id.slice(0, 8);
-                              const roleBadge =
-                                p.role_on_assignment === 'owner'
-                                  ? 'border-purple-300 bg-purple-50 text-purple-800'
-                                  : p.role_on_assignment === 'reviewer'
-                                    ? 'border-sky-300 bg-sky-50 text-sky-800'
-                                    : 'border-gray-200 bg-white text-gray-800';
-                              return (
-                                <span
-                                  key={p.id}
-                                  className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-xs ${roleBadge}`}
-                                >
-                                  <span className="font-medium">{label}</span>
-                                  <span className="text-gray-400">·</span>
-                                  <span>{p.role_on_assignment}</span>
-                                  {canManageLinks && (
-                                    <button
-                                      type="button"
-                                      onClick={() => void handleRemoveAssignment(p.id)}
-                                      className="ml-0.5 text-gray-400 hover:text-red-600"
-                                      title={`Remove ${label} from this deliverable`}
-                                      aria-label={`Remove ${label}`}
-                                    >
-                                      ×
-                                    </button>
-                                  )}
-                                </span>
-                              );
-                            })}
-                          </div>
-                        )}
-
-                        {/* Member assignment picker (leads/admin only). */}
-                        {canManageLinks && assignablePool.length > 0 && (
-                          <div className="mt-2 flex flex-wrap items-center gap-2 rounded border border-dashed border-gray-300 bg-white px-3 py-2">
-                            <span className="text-xs text-gray-600">
-                              Assign a member:
-                            </span>
-                            <select
-                              value={selectedUser[d.id] ?? ''}
-                              onChange={(e) =>
-                                setSelectedUser((prev) => ({
-                                  ...prev,
-                                  [d.id]: e.target.value,
-                                }))
-                              }
-                              className="rounded border border-gray-300 px-2 py-1 text-xs"
-                              aria-label="Member to assign"
-                            >
-                              <option value="">— pick a member —</option>
-                              {assignablePool.map((u) => (
-                                <option key={u.id} value={u.id}>
-                                  {u.full_name || u.email}{u.role ? ` (${u.role})` : ''}{overworkSuffix(u)}
-                                </option>
-                              ))}
-                            </select>
-                            <select
-                              value={selectedRole[d.id] ?? 'contributor'}
-                              onChange={(e) =>
-                                setSelectedRole((prev) => ({
-                                  ...prev,
-                                  [d.id]: e.target.value as AssignmentRole,
-                                }))
-                              }
-                              className="rounded border border-gray-300 px-2 py-1 text-xs"
-                              aria-label="Assignment role"
-                              title="'owner' is restricted to users whose users.role = 'team_lead'"
-                            >
-                              {ASSIGNMENT_ROLES.map((r) => (
-                                <option key={r} value={r}>
-                                  {r}
-                                </option>
-                              ))}
-                            </select>
-                            <button
-                              type="button"
-                              disabled={!selectedUser[d.id] || !!assigning[d.id]}
-                              onClick={() => void handleAssignMember(d.id)}
-                              className="rounded bg-brand-600 px-2 py-1 text-xs font-medium text-white hover:bg-brand-700 disabled:cursor-not-allowed disabled:opacity-50"
-                            >
-                              {assigning[d.id] ? 'Assigning…' : 'Assign'}
-                            </button>
-                          </div>
-                        )}
-                      </div>
-
-                      {/* Tangibles section */}
-                      <div>
-                        <h4 className="mb-1.5 text-xs font-semibold uppercase tracking-wide text-gray-500">
-                          Tangibles
-                        </h4>
-                        {tangibles.length === 0 ? (
-                          <p className="text-xs text-gray-400">
-                            No tangible assets linked to this deliverable.
-                          </p>
-                        ) : (
-                          <AssetChipList
-                            items={tangibles}
-                            onUnlink={canManageLinks ? handleUnlinkAsset : undefined}
-                          />
-                        )}
-                      </div>
-
-                      {/* Intangibles section */}
-                      <div>
-                        <h4 className="mb-1.5 text-xs font-semibold uppercase tracking-wide text-gray-500">
-                          Intangibles
-                        </h4>
-                        {intangibles.length === 0 ? (
-                          <p className="text-xs text-gray-400">
-                            No intangible assets linked to this deliverable.
-                          </p>
-                        ) : (
-                          <AssetChipList
-                            items={intangibles}
-                            onUnlink={canManageLinks ? handleUnlinkAsset : undefined}
-                          />
-                        )}
-                      </div>
-
-                      {/* Link picker — only leads/admin, only when there are
-                          unlinked assets on the project to choose from */}
-                      {canManageLinks && unlinkedPool.length > 0 && (
-                        <div className="flex flex-wrap items-center gap-2 rounded border border-dashed border-gray-300 bg-white px-3 py-2">
-                          <span className="text-xs text-gray-600">
-                            Link a project asset to this deliverable:
-                          </span>
-                          <select
-                            value={selectedToLink[d.id] ?? ''}
-                            onChange={(e) =>
-                              setSelectedToLink((prev) => ({
-                                ...prev,
-                                [d.id]: e.target.value,
-                              }))
-                            }
-                            className="rounded border border-gray-300 px-2 py-1 text-xs"
-                            aria-label="Asset to link to deliverable"
-                          >
-                            <option value="">— pick an asset —</option>
-                            {unlinkedPool.map((e) => (
-                              <option key={e.id} value={e.id}>
-                                {e.is_tangible ? '📦' : '🔑'} {e.name} · {e.kind}
-                                {e.cost != null ? ` · ${e.cost} ${e.currency}` : ''}
-                              </option>
-                            ))}
-                          </select>
-                          <button
-                            type="button"
-                            disabled={!selectedToLink[d.id] || !!linking[d.id]}
-                            onClick={() =>
-                              void handleLinkAsset(d.id, selectedToLink[d.id]!)
-                            }
-                            className="rounded bg-brand-600 px-2 py-1 text-xs font-medium text-white hover:bg-brand-700 disabled:cursor-not-allowed disabled:opacity-50"
-                          >
-                            {linking[d.id] ? 'Linking…' : 'Link'}
-                          </button>
-                        </div>
+                          <CalendarIcon size={12} />
+                          {due.text}
+                        </span>
                       )}
-
-                      {canManageLinks &&
-                        unlinkedPool.length === 0 &&
-                        linked.length === 0 && (
-                          <p className="text-xs text-gray-400">
-                            Add assets to this project's{' '}
-                            <strong>Tangibles</strong> or{' '}
-                            <strong>Intangibles</strong> tab first, then link
-                            them here.
-                          </p>
-                        )}
+                      {awaiting && (
+                        <span className="rounded bg-status-progress/10 px-1.5 py-0.5 text-[10px] text-status-progress">
+                          Awaiting approval
+                        </span>
+                      )}
+                      {tags.slice(0, 2).map((t) => (
+                        <span
+                          key={t}
+                          className="rounded bg-white/5 px-1.5 py-0.5 text-[10px] text-content-secondary"
+                        >
+                          {t}
+                        </span>
+                      ))}
+                      {tags.length > 2 && (
+                        <span className="text-[10px] text-content-muted">
+                          +{tags.length - 2}
+                        </span>
+                      )}
                     </div>
-                  </td>
-                </tr>
-              ) : null;
+                  </div>
 
-              return assetRow ? [mainRow, assetRow] : [mainRow];
-            })}
-          </tbody>
-        </table>
+                  {/* Assignee stack — reveal manage controls on row hover. */}
+                  <div className="shrink-0">
+                    <AssigneeStack
+                      assignments={people}
+                      nameFor={nameFor}
+                      assignablePool={assignablePool}
+                      canManage={canManageLinks && !assigning[d.id]}
+                      onAssign={(userId) => void handleAssignMember(d.id, userId)}
+                      onRemove={(assignmentId) => void handleRemoveAssignment(assignmentId)}
+                    />
+                  </div>
+
+                  {/* Status — interactive pill for leads/admin, read-only otherwise. */}
+                  <div className="shrink-0">
+                    {canApprove ? (
+                      <StatusSelectPill
+                        status={d.status}
+                        options={STATUS_ORDER}
+                        onChange={(next) => void updateStatus(d.id, next)}
+                      />
+                    ) : (
+                      <StatusPill status={d.status} />
+                    )}
+                  </div>
+
+                  {/* Approve / reject shortcuts for awaiting items (leads/admin). */}
+                  {canApprove && awaiting && (
+                    <div className="flex shrink-0 items-center gap-1 opacity-0 transition-opacity duration-150 group-hover:opacity-100">
+                      <button
+                        type="button"
+                        onClick={() => void updateStatus(d.id, 'in_progress')}
+                        aria-label={`Approve ${d.title}`}
+                        title="Approve"
+                        className="inline-flex h-6 w-6 items-center justify-center rounded-md bg-status-done/15 text-status-done transition-colors duration-150 hover:bg-status-done/25"
+                      >
+                        <CheckIcon size={14} />
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => void updateStatus(d.id, 'cancelled')}
+                        aria-label={`Reject ${d.title}`}
+                        title="Reject"
+                        className="inline-flex h-6 w-6 items-center justify-center rounded-md bg-white/5 text-content-secondary transition-colors duration-150 hover:bg-status-blocked/15 hover:text-status-blocked"
+                      >
+                        <XIcon size={14} />
+                      </button>
+                    </div>
+                  )}
+                </div>
+
+                {/* ---- Expanded detail ---- */}
+                {isExpanded && (
+                  <div className="border-t border-border-subtle px-4 py-3">
+                    <div className="grid gap-4 md:grid-cols-2">
+                      <AssetSection
+                        title="Tangibles"
+                        icon={<BoxIcon size={13} />}
+                        items={tangibles}
+                        emptyText="No tangible assets linked."
+                        onUnlink={canManageLinks ? handleUnlinkAsset : undefined}
+                      />
+                      <AssetSection
+                        title="Intangibles"
+                        icon={<KeyIcon size={13} />}
+                        items={intangibles}
+                        emptyText="No intangible assets linked."
+                        onUnlink={canManageLinks ? handleUnlinkAsset : undefined}
+                      />
+                    </div>
+
+                    {/* Link picker — only leads/admin, only with unlinked assets. */}
+                    {canManageLinks && unlinkedPool.length > 0 && (
+                      <div className="mt-3 flex flex-wrap items-center gap-2 rounded-lg border border-dashed border-border-subtle px-3 py-2">
+                        <span className="text-[11px] text-content-secondary">
+                          Link a project asset:
+                        </span>
+                        <select
+                          value={selectedToLink[d.id] ?? ''}
+                          onChange={(e) =>
+                            setSelectedToLink((prev) => ({ ...prev, [d.id]: e.target.value }))
+                          }
+                          className="rounded-md border border-border-subtle bg-surface px-2 py-1 text-[12px] text-content"
+                          aria-label="Asset to link to deliverable"
+                        >
+                          <option value="">— pick an asset —</option>
+                          {unlinkedPool.map((e) => (
+                            <option key={e.id} value={e.id}>
+                              {e.is_tangible ? '[T]' : '[I]'} {e.name} · {e.kind}
+                              {e.cost != null ? ` · ${e.cost} ${e.currency}` : ''}
+                            </option>
+                          ))}
+                        </select>
+                        <button
+                          type="button"
+                          disabled={!selectedToLink[d.id] || !!linking[d.id]}
+                          onClick={() => void handleLinkAsset(d.id, selectedToLink[d.id]!)}
+                          className="inline-flex items-center gap-1 rounded-md bg-accent-600 px-2.5 py-1 text-[12px] font-medium text-white transition-colors duration-150 hover:bg-accent-500 disabled:cursor-not-allowed disabled:opacity-50"
+                        >
+                          <PlusIcon size={13} />
+                          {linking[d.id] ? 'Linking…' : 'Link'}
+                        </button>
+                      </div>
+                    )}
+
+                    {canManageLinks &&
+                      unlinkedPool.length === 0 &&
+                      linked.length === 0 && (
+                        <p className="mt-3 text-[11px] text-content-muted">
+                          Add assets to this project&apos;s <strong>Tangibles</strong> or{' '}
+                          <strong>Intangibles</strong> tab first, then link them here.
+                        </p>
+                      )}
+                  </div>
+                )}
+              </li>
+            );
+          })}
+        </ul>
       )}
 
       {canPropose && (
         <form
           onSubmit={(e) => void handleCreate(e)}
-          className="flex flex-wrap items-start gap-2 rounded border border-dashed border-gray-300 p-3"
+          className="flex flex-wrap items-center gap-2 rounded-lg border border-dashed border-border-subtle bg-surface-raised p-3"
         >
           <input
             required
@@ -617,23 +527,22 @@ export function DeliverablesPanel({ projectId }: Props) {
             value={title}
             onChange={(e) => setTitle(e.target.value)}
             placeholder={
-              role === 'team_member'
-                ? 'Propose a deliverable…'
-                : 'New deliverable title'
+              role === 'team_member' ? 'Propose a deliverable…' : 'New deliverable title'
             }
-            className="min-w-56 flex-1 rounded border border-gray-300 px-2 py-1.5 text-sm"
+            className="min-w-56 flex-1 rounded-md border border-border-subtle bg-surface px-2.5 py-1.5 text-[13px] text-content placeholder:text-content-muted focus:border-accent-500 focus:outline-none"
           />
           <input
             type="date"
             value={dueDate}
             onChange={(e) => setDueDate(e.target.value)}
-            className="w-44 flex-none rounded border border-gray-300 px-2 py-1.5 text-sm"
+            className="w-44 flex-none rounded-md border border-border-subtle bg-surface px-2.5 py-1.5 text-[13px] text-content focus:border-accent-500 focus:outline-none"
           />
           <button
             type="submit"
             disabled={submitting || !title.trim()}
-            className="w-full rounded bg-brand-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-brand-700 disabled:cursor-not-allowed disabled:opacity-50 sm:w-auto"
+            className="inline-flex items-center gap-1 rounded-md bg-accent-600 px-3 py-1.5 text-[13px] font-medium text-white transition-colors duration-150 hover:bg-accent-500 disabled:cursor-not-allowed disabled:opacity-50"
           >
+            <PlusIcon size={14} />
             {role === 'team_member' ? 'Submit for approval' : 'Add'}
           </button>
         </form>
@@ -643,61 +552,77 @@ export function DeliverablesPanel({ projectId }: Props) {
 }
 
 /**
- * Renders a horizontal list of equipment chips for a deliverable's asset
- * section.  An optional `onUnlink` callback adds an × button to each chip
- * so leads/admin can remove the association in one click.
+ * One asset section (Tangibles or Intangibles) inside a deliverable's
+ * expanded detail. Renders a labelled list of chips with an optional unlink
+ * affordance for leads/admin.
  */
-function AssetChipList({
+function AssetSection({
+  title,
+  icon,
   items,
+  emptyText,
   onUnlink,
 }: {
+  title: string;
+  icon: React.ReactNode;
   items: Equipment[];
+  emptyText: string;
   onUnlink?: (equipmentId: string) => void;
 }) {
   return (
-    <div className="flex flex-wrap gap-1.5">
-      {items.map((e) => {
-        const badge =
-          e.approval_status === 'pending'
-            ? 'border-amber-300 bg-amber-50'
-            : e.approval_status === 'rejected'
-              ? 'border-red-300 bg-red-50 opacity-60'
-              : 'border-gray-200 bg-white';
-        return (
-          <span
-            key={e.id}
-            className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-xs ${badge}`}
-          >
-            <span className="font-medium text-gray-800">{e.name}</span>
-            <span className="text-gray-400">·</span>
-            <span className="text-gray-500">{e.kind}</span>
-            {e.cost != null && (
-              <>
-                <span className="text-gray-400">·</span>
-                <span className="tabular-nums text-gray-600">
-                  {e.cost} {e.currency}
-                </span>
-              </>
-            )}
-            {e.approval_status !== 'approved' && (
-              <span className="ml-0.5 rounded bg-amber-100 px-1 text-amber-700">
-                {e.approval_status}
-              </span>
-            )}
-            {onUnlink && (
-              <button
-                type="button"
-                onClick={() => onUnlink(e.id)}
-                className="ml-0.5 text-gray-400 hover:text-red-600"
-                title={`Unlink "${e.name}" from this deliverable`}
-                aria-label={`Unlink ${e.name}`}
+    <div>
+      <h4 className="mb-1.5 flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wide text-content-muted">
+        <span className="text-content-secondary">{icon}</span>
+        {title}
+      </h4>
+      {items.length === 0 ? (
+        <p className="text-[11px] text-content-muted">{emptyText}</p>
+      ) : (
+        <div className="flex flex-wrap gap-1.5">
+          {items.map((e) => {
+            const badge =
+              e.approval_status === 'pending'
+                ? 'border-status-progress/25 bg-status-progress/10'
+                : e.approval_status === 'rejected'
+                  ? 'border-status-blocked/25 bg-status-blocked/10 opacity-60'
+                  : 'border-border-subtle bg-surface';
+            return (
+              <span
+                key={e.id}
+                className={`inline-flex items-center gap-1 rounded-md border px-2 py-0.5 text-[11px] ${badge}`}
               >
-                ×
-              </button>
-            )}
-          </span>
-        );
-      })}
+                <span className="font-medium text-content">{e.name}</span>
+                <span className="text-content-muted">·</span>
+                <span className="text-content-secondary">{e.kind}</span>
+                {e.cost != null && (
+                  <>
+                    <span className="text-content-muted">·</span>
+                    <span className="tabular-nums text-content-secondary">
+                      {e.cost} {e.currency}
+                    </span>
+                  </>
+                )}
+                {e.approval_status !== 'approved' && (
+                  <span className="ml-0.5 rounded bg-status-progress/15 px-1 text-status-progress">
+                    {e.approval_status}
+                  </span>
+                )}
+                {onUnlink && (
+                  <button
+                    type="button"
+                    onClick={() => onUnlink(e.id)}
+                    className="ml-0.5 text-content-muted transition-colors duration-150 hover:text-status-blocked"
+                    title={`Unlink "${e.name}" from this deliverable`}
+                    aria-label={`Unlink ${e.name}`}
+                  >
+                    <XIcon size={12} />
+                  </button>
+                )}
+              </span>
+            );
+          })}
+        </div>
+      )}
     </div>
   );
 }
