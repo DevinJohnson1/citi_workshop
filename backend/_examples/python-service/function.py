@@ -11,7 +11,6 @@ from postgres_service import get_postgres_version
 
 # Configure logging for Lambda
 logger = logging.getLogger()
-logger.setLevel(logging.INFO)
 
 # PostgreSQL connection string built from environment variables with sensible defaults
 PG_CONFIG = (

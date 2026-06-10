@@ -3,14 +3,14 @@ module "lambda" {
   source   = "terraform-aws-modules/lambda/aws"
   version  = "~> 8.0"
 
-  function_name   = format("%s-%s-%s", var.aws_project, each.value.name, local.app_id)
-  package_type    = "Zip"
-  architectures   = [each.value.arch]
-  handler         = each.value.handler
-  runtime         = each.value.runtime
-  memory_size     = 128
-  timeout         = 300
-  tracing_mode    = "PassThrough"
+  function_name = format("%s-%s-%s", var.aws_project, each.value.name, local.app_id)
+  package_type  = "Zip"
+  architectures = [each.value.arch]
+  handler       = each.value.handler
+  runtime       = each.value.runtime
+  memory_size   = 128
+  timeout       = 300
+  tracing_mode  = "PassThrough"
   # Build the deployment package inside the official AWS SAM build image for the
   # target runtime, so the host doesn't need a matching `python3.11` binary in
   # PATH. Without this, the module shells out to the host interpreter and fails
@@ -83,7 +83,7 @@ resource "aws_sqs_queue" "this" {
 }
 
 resource "null_resource" "hot_reload" {
-  for_each = {for k, v in local.function_names : k => v if data.aws_caller_identity.this.id == "000000000000"}
+  for_each = { for k, v in local.function_names : k => v if data.aws_caller_identity.this.id == "000000000000" }
 
   triggers = {
     source_code_hash = module.lambda[each.key].lambda_function_source_code_hash

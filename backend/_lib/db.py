@@ -54,9 +54,27 @@ def get_conn() -> psycopg.Connection:
     connection between warm invocations. Mutations should still wrap their
     work in :func:`transaction` so the matching ``INSERT INTO audit_log``
     commits atomically.
+
+    The cached connection is also pinged with a cheap ``SELECT 1`` before
+    being handed back. ``Connection.closed`` only flips to True after a
+    clean ``.close()`` — a TCP-side drop (idle timeout, LocalStack restart,
+    Aurora connection recycle) leaves the socket *looking* open but the
+    next ``execute`` raises ``OperationalError``. Without this guard, the
+    first request after every idle window returned a 500 to the frontend
+    (visible intermittently on the reports dashboard, which fires several
+    parallel queries through warm containers).
     """
     global _CONN
     if _CONN is None or _CONN.closed:
+        _CONN = psycopg.connect(_conninfo(), row_factory=dict_row, autocommit=True)
+        return _CONN
+    try:
+        with _CONN.cursor() as cur:
+            cur.execute("SELECT 1")
+            cur.fetchone()
+    except psycopg.Error:
+        _LOG.warning("Cached DB connection is stale; reconnecting", exc_info=True)
+        reset_conn()
         _CONN = psycopg.connect(_conninfo(), row_factory=dict_row, autocommit=True)
     return _CONN
 
@@ -106,7 +124,7 @@ def audit(
             INSERT INTO audit_log (user_id, action, target_type, target_id, payload)
             VALUES (%s, %s, %s, %s, %s::jsonb)
             """,
-            (user_id, action, target_type, target_id, json.dumps(payload or {})),
+            (user_id, action, target_type, target_id, json.dumps(payload or {}, default=str)),
         )
 
 

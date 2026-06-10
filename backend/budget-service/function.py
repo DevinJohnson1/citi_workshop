@@ -1,12 +1,21 @@
-"""budget-service — immutable ``budget_plans`` + append-only ``budget_entries``.
+"""budget-service — singular per-project budget on ``projects.budget_amount``.
+
+Earlier versions of this service maintained a separate ``budget_plans`` +
+``budget_entries`` pair so a project could be broken down into multiple
+categories with append-only spend entries. That model has been collapsed:
+each project now carries one budget ceiling
+(``projects.budget_amount`` + ``projects.budget_currency``) and the only
+thing that draws against it is the ``cost`` of equipment (tangibles /
+intangibles) assigned to the project. The equipment-service enforces the
+ceiling on create / patch — this service only reads/writes the ceiling and
+returns the live ``amount_consumed`` rollup.
 
 Routes (relative to ``/api/budget-service``)::
 
-    GET    /                              ?project_id=  → plans + amount_consumed
-    POST   /                              create plan
-    DELETE /{plan_id}                     admin only, cascades entries
-    GET    /{plan_id}/entries             list entries
-    POST   /{plan_id}/entries             append entry
+    GET    /?project_id=…   → {project_id, budget_amount, budget_currency,
+                                amount_consumed, remaining, charges:[…]}
+    PUT    /                 set/update the project's budget
+    DELETE /?project_id=…    clear the project's budget (admin only)
 """
 
 from __future__ import annotations
@@ -22,24 +31,19 @@ from _lib.auth import AuthError, current_user, handle_auth_errors, verify_token
 from _lib.validation import StrictModel, first_error
 
 _LOG = logging.getLogger()
-_LOG.setLevel(logging.INFO)
 _SERVICE = "budget-service"
 
 
-class PlanCreate(StrictModel):
-    """Body for ``POST /api/budget-service``."""
+class BudgetUpsert(StrictModel):
+    """Body for ``PUT /api/budget-service``.
+
+    ``budget_amount`` may be omitted/null to clear the ceiling, but the
+    explicit DELETE endpoint is the preferred way to do that.
+    """
 
     project_id: str
-    category: str = Field(min_length=1, max_length=80)
-    amount_planned: Decimal = Field(ge=Decimal("0"))
-    currency: str = Field(default="USD", min_length=3, max_length=3)
-
-
-class EntryCreate(StrictModel):
-    """Body for ``POST /api/budget-service/{plan_id}/entries``."""
-
-    amount: Decimal = Field(ge=Decimal("0"))
-    description: str = ""
+    budget_amount: Decimal | None = Field(default=None, ge=Decimal("0"))
+    budget_currency: str = Field(default="USD", min_length=3, max_length=3)
 
 
 def handler(event: Mapping[str, Any], context: Any = None) -> dict[str, Any]:
@@ -53,16 +57,11 @@ def handler(event: Mapping[str, Any], context: Any = None) -> dict[str, Any]:
             return http.ok({"status": "UP", "db": "UP" if db.health() else "DOWN"}, event)
         if method == "GET" and not parts:
             verify_token(event)
-            return _list_plans(event)
-        if method == "POST" and not parts:
-            return _create_plan(event)
-        if method == "DELETE" and len(parts) == 1:
-            return _delete_plan(event, parts[0])
-        if method == "GET" and len(parts) == 2 and parts[1] == "entries":
-            verify_token(event)
-            return _list_entries(event, parts[0])
-        if method == "POST" and len(parts) == 2 and parts[1] == "entries":
-            return _create_entry(event, parts[0])
+            return _get_budget(event)
+        if method == "PUT" and not parts:
+            return _upsert_budget(event)
+        if method == "DELETE" and not parts:
+            return _clear_budget(event)
         return http.not_found(event=event)
     except AuthError as exc:
         return handle_auth_errors(event, exc)
@@ -76,112 +75,148 @@ def handler(event: Mapping[str, Any], context: Any = None) -> dict[str, Any]:
         return http.error(event=event)
 
 
-def _list_plans(event: Mapping[str, Any]) -> dict[str, Any]:
-    qs = http.query_params(event)
-    where = ""
-    params: list[Any] = []
-    if pid := qs.get("project_id"):
-        where = "WHERE bp.project_id = %s"
-        params.append(pid)
-    conn = db.get_conn()
+# ── helpers ────────────────────────────────────────────────────────────────
+
+def _project(conn, project_id: str) -> dict[str, Any] | None:
+    """Return the project's id/owner/budget fields, or None if missing."""
     with conn.cursor() as cur:
         cur.execute(
-            f"""
-            SELECT bp.*,
-                   COALESCE(SUM(be.amount), 0)::numeric(14,2) AS amount_consumed
-            FROM budget_plans bp
-            LEFT JOIN budget_entries be ON be.budget_plan_id = bp.id
-            {where}
-            GROUP BY bp.id
-            ORDER BY bp.created_at DESC
-            """,
-            params,
+            "SELECT id, owner_id, budget_amount, budget_currency "
+            "FROM projects WHERE id = %s",
+            (project_id,),
         )
-        rows = cur.fetchall()
-    return http.ok({"data": rows, "meta": {"total": len(rows), "limit": len(rows), "offset": 0}}, event)
+        return cur.fetchone()
 
 
-def _project_owner(conn, project_id: str) -> str | None:
+def _charges(conn, project_id: str) -> list[dict[str, Any]]:
+    """Equipment rows currently assigned to the project.
+
+    Rejected rows are excluded — they never draw against the budget. Pending
+    rows *are* included because reserving budget while approval is in flight
+    is the whole point of the gate (avoids two leads approving items that
+    individually fit but together overflow). Rows with NULL ``cost`` are
+    included too so the user can see them in the per-project Budget tab
+    (they contribute 0 to ``amount_consumed`` — the SUM ignores NULLs).
+    """
     with conn.cursor() as cur:
-        cur.execute("SELECT owner_id FROM projects WHERE id = %s", (project_id,))
-        row = cur.fetchone()
-    return row["owner_id"] if row else None
-
-
-def _create_plan(event: Mapping[str, Any]) -> dict[str, Any]:
-    user = current_user(event)
-    body = PlanCreate(**http.parse_json_body(event))
-    conn = db.get_conn()
-    owner = _project_owner(conn, body.project_id)
-    if owner is None:
-        return http.not_found("Project not found", event)
-    if user["role"] != "admin" and not (user["role"] == "team_lead" and owner == user["id"]):
-        raise AuthError(403, "Insufficient role")
-    with db.transaction() as conn, conn.cursor() as cur:
         cur.execute(
             """
-            INSERT INTO budget_plans (project_id, category, amount_planned, currency, created_by)
-            VALUES (%s, %s, %s, %s, %s)
-            RETURNING *
+            SELECT id, name, kind, is_tangible, cost, currency,
+                   status, approval_status
+            FROM equipment
+            WHERE assigned_project_id = %s
+              AND approval_status IN ('approved', 'pending')
+            ORDER BY is_tangible DESC, name
             """,
-            (body.project_id, body.category, body.amount_planned, body.currency.upper(), user["id"]),
+            (project_id,),
         )
-        row = cur.fetchone()
-        db.audit(conn, user["id"], "budget_plan.created", "budget_plan", row["id"],
-                 {"project_id": body.project_id, "category": body.category})
-    return http.created(row, event)
+        return list(cur.fetchall())
 
 
-def _delete_plan(event: Mapping[str, Any], plan_id: str) -> dict[str, Any]:
+def _budget_payload(project: dict[str, Any], charges: list[dict[str, Any]]) -> dict[str, Any]:
+    """Pack the projection returned by GET and after PUT."""
+    consumed = sum(
+        (Decimal(c["cost"]) for c in charges if c["cost"] is not None),
+        start=Decimal("0"),
+    )
+    planned = project["budget_amount"]
+    remaining: Decimal | None = (
+        Decimal(planned) - consumed if planned is not None else None
+    )
+    return {
+        "project_id": project["id"],
+        "budget_amount": planned,
+        "budget_currency": project["budget_currency"],
+        "amount_consumed": consumed,
+        "remaining": remaining,
+        "charges": charges,
+    }
+
+
+def _require_owner_or_admin(user: Mapping[str, Any], owner_id: str) -> None:
+    """Match projects-service: admin OR the owning team_lead may write."""
+    if user["role"] == "admin":
+        return
+    if user["role"] == "team_lead" and owner_id == user["id"]:
+        return
+    raise AuthError(403, "Insufficient role")
+
+
+# ── handlers ───────────────────────────────────────────────────────────────
+
+def _get_budget(event: Mapping[str, Any]) -> dict[str, Any]:
+    qs = http.query_params(event)
+    project_id = qs.get("project_id")
+    if not project_id:
+        raise ValueError("project_id: query parameter is required")
+    conn = db.get_conn()
+    project = _project(conn, project_id)
+    if project is None:
+        return http.not_found("Project not found", event)
+    charges = _charges(conn, project_id)
+    return http.ok(_budget_payload(project, charges), event)
+
+
+def _upsert_budget(event: Mapping[str, Any]) -> dict[str, Any]:
     user = current_user(event)
+    body = BudgetUpsert(**http.parse_json_body(event))
+    conn = db.get_conn()
+    project = _project(conn, body.project_id)
+    if project is None:
+        return http.not_found("Project not found", event)
+    _require_owner_or_admin(user, project["owner_id"])
+
+    # Refuse to lower the ceiling below what's already committed to assigned
+    # equipment — otherwise existing tangibles would be silently underwater.
+    if body.budget_amount is not None:
+        committed_charges = _charges(conn, body.project_id)
+        committed = sum(
+            (Decimal(c["cost"]) for c in committed_charges if c["cost"] is not None),
+            start=Decimal("0"),
+        )
+        if body.budget_amount < committed:
+            raise ValueError(
+                f"budget_amount: cannot be lower than already committed equipment "
+                f"costs ({committed} {body.budget_currency.upper()})"
+            )
+
+    with db.transaction() as conn, conn.cursor() as cur:
+        cur.execute(
+            "UPDATE projects "
+            "SET budget_amount = %s, budget_currency = %s "
+            "WHERE id = %s "
+            "RETURNING id, owner_id, budget_amount, budget_currency",
+            (body.budget_amount, body.budget_currency.upper(), body.project_id),
+        )
+        updated = cur.fetchone()
+        db.audit(
+            conn, user["id"], "project_budget.updated", "project", body.project_id,
+            {
+                "budget_amount": str(body.budget_amount) if body.budget_amount is not None else None,
+                "budget_currency": body.budget_currency.upper(),
+            },
+        )
+    charges = _charges(db.get_conn(), body.project_id)
+    return http.ok(_budget_payload(updated, charges), event)
+
+
+def _clear_budget(event: Mapping[str, Any]) -> dict[str, Any]:
+    user = current_user(event)
+    qs = http.query_params(event)
+    project_id = qs.get("project_id")
+    if not project_id:
+        raise ValueError("project_id: query parameter is required")
+    conn = db.get_conn()
+    project = _project(conn, project_id)
+    if project is None:
+        return http.not_found("Project not found", event)
+    # Clearing the ceiling is admin-only — it disables the budget gate for
+    # the project entirely, and we don't want a single team_lead doing that.
     if user["role"] != "admin":
         raise AuthError(403, "Insufficient role")
     with db.transaction() as conn, conn.cursor() as cur:
-        cur.execute("DELETE FROM budget_plans WHERE id = %s RETURNING id", (plan_id,))
-        if not cur.fetchone():
-            return http.not_found(event=event)
-        db.audit(conn, user["id"], "budget_plan.deleted", "budget_plan", plan_id, None)
+        cur.execute("UPDATE projects SET budget_amount = NULL WHERE id = %s", (project_id,))
+        db.audit(conn, user["id"], "project_budget.cleared", "project", project_id, None)
     return http.no_content(event)
 
-
-def _list_entries(event: Mapping[str, Any], plan_id: str) -> dict[str, Any]:
-    conn = db.get_conn()
-    with conn.cursor() as cur:
-        cur.execute(
-            "SELECT * FROM budget_entries WHERE budget_plan_id = %s "
-            "ORDER BY recorded_at DESC, created_at DESC",
-            (plan_id,),
-        )
-        rows = cur.fetchall()
-    return http.ok({"data": rows, "meta": {"total": len(rows), "limit": len(rows), "offset": 0}}, event)
-
-
-def _create_entry(event: Mapping[str, Any], plan_id: str) -> dict[str, Any]:
-    user = current_user(event)
-    conn = db.get_conn()
-    with conn.cursor() as cur:
-        cur.execute(
-            "SELECT bp.id, p.owner_id FROM budget_plans bp "
-            "JOIN projects p ON p.id = bp.project_id WHERE bp.id = %s",
-            (plan_id,),
-        )
-        plan = cur.fetchone()
-    if not plan:
-        return http.not_found("Budget plan not found", event)
-    if user["role"] != "admin" and not (user["role"] == "team_lead" and plan["owner_id"] == user["id"]):
-        raise AuthError(403, "Insufficient role")
-    body = EntryCreate(**http.parse_json_body(event))
-    with db.transaction() as conn, conn.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO budget_entries (budget_plan_id, amount, description, recorded_by)
-            VALUES (%s, %s, %s, %s)
-            RETURNING *
-            """,
-            (plan_id, body.amount, body.description, user["id"]),
-        )
-        row = cur.fetchone()
-        db.audit(conn, user["id"], "budget_entry.recorded", "budget_entry", row["id"],
-                 {"budget_plan_id": plan_id, "amount": str(body.amount)})
-    return http.created(row, event)
 

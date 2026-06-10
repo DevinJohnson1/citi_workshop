@@ -19,7 +19,6 @@ from _lib.auth import AuthError, current_user, handle_auth_errors, verify_token
 from _lib.validation import AssignmentRole, StrictModel, first_error
 
 _LOG = logging.getLogger()
-_LOG.setLevel(logging.INFO)
 _SERVICE = "assignments-service"
 _ROLES: frozenset[str] = frozenset(get_args(AssignmentRole))
 

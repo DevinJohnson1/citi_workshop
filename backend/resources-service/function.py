@@ -18,11 +18,10 @@ from typing import Any, Literal, Mapping
 from pydantic import Field, ValidationError
 
 from _lib import db, http
-from _lib.auth import AuthError, current_user, handle_auth_errors, invalidate_user_cache, verify_token
+from _lib.auth import AuthError, current_user, handle_auth_errors, verify_token
 from _lib.validation import StrictModel, first_error
 
 _LOG = logging.getLogger()
-_LOG.setLevel(logging.INFO)
 _SERVICE = "resources-service"
 
 # Roles an admin may PROMOTE/DEMOTE someone TO. Note the deliberate exclusion
@@ -84,6 +83,48 @@ _PROJECTION = (
     "weekly_capacity_hours, role, created_at, updated_at"
 )
 
+# A user is flagged "overworked" when EITHER of these is exceeded.
+# Defined at the SQL projection level so every consumer of this service
+# (people page, allocation picker, deliverable-assignment picker, …) sees
+# the same threshold without having to recompute it on the client.
+_OVERWORK_PROJECT_THRESHOLD = 3
+_OVERWORK_DELIVERABLE_THRESHOLD = 10
+
+# Workload counters joined onto every user row. Defined as a SQL fragment so
+# both the list and the single-row read share one source of truth.
+#
+#   active_project_count     — distinct projects the user has at least one
+#                              APPROVED allocation on. Counted once per
+#                              project even if multiple allocation rows exist.
+#   active_deliverable_count — open assignments (completed_at IS NULL). One
+#                              user/deliverable pair is one count regardless
+#                              of role_on_assignment.
+#   is_overworked            — derived boolean evaluated in SQL so it can't
+#                              drift between the API and the UI.
+_WORKLOAD_PROJECTION = f"""
+    COALESCE((
+        SELECT COUNT(DISTINCT project_id)
+        FROM allocations a
+        WHERE a.user_id = u.id AND a.approval_status = 'approved'
+    ), 0) AS active_project_count,
+    COALESCE((
+        SELECT COUNT(*)
+        FROM assignments asg
+        WHERE asg.user_id = u.id AND asg.completed_at IS NULL
+    ), 0) AS active_deliverable_count,
+    (
+        COALESCE((
+            SELECT COUNT(DISTINCT project_id)
+            FROM allocations a WHERE a.user_id = u.id AND a.approval_status = 'approved'
+        ), 0) > {_OVERWORK_PROJECT_THRESHOLD}
+        OR
+        COALESCE((
+            SELECT COUNT(*)
+            FROM assignments asg WHERE asg.user_id = u.id AND asg.completed_at IS NULL
+        ), 0) > {_OVERWORK_DELIVERABLE_THRESHOLD}
+    ) AS is_overworked
+"""
+
 
 def _list(event: Mapping[str, Any]) -> dict[str, Any]:
     """List staffable users by default; ``?all=true`` returns everyone."""
@@ -96,14 +137,14 @@ def _list(event: Mapping[str, Any]) -> dict[str, Any]:
     if qs.get("all") == "true":
         where = ""
     else:
-        where = "WHERE role IN ('team_lead','team_member')"
+        where = "WHERE u.role IN ('team_lead','team_member')"
     conn = db.get_conn()
     with conn.cursor() as cur:
-        cur.execute(f"SELECT COUNT(*) AS n FROM users {where}")
+        cur.execute(f"SELECT COUNT(*) AS n FROM users u {where}")
         total = cur.fetchone()["n"]
         cur.execute(
-            f"SELECT {_PROJECTION} FROM users {where} "
-            f"ORDER BY full_name NULLS LAST, email LIMIT %s OFFSET %s",
+            f"SELECT {_PROJECTION}, {_WORKLOAD_PROJECTION} FROM users u {where} "
+            f"ORDER BY u.full_name NULLS LAST, u.email LIMIT %s OFFSET %s",
             (limit, offset),
         )
         rows = cur.fetchall()
@@ -113,7 +154,10 @@ def _list(event: Mapping[str, Any]) -> dict[str, Any]:
 def _get(event: Mapping[str, Any], user_id: str) -> dict[str, Any]:
     conn = db.get_conn()
     with conn.cursor() as cur:
-        cur.execute(f"SELECT {_PROJECTION} FROM users WHERE id = %s", (user_id,))
+        cur.execute(
+            f"SELECT {_PROJECTION}, {_WORKLOAD_PROJECTION} FROM users u WHERE u.id = %s",
+            (user_id,),
+        )
         row = cur.fetchone()
     if not row:
         return http.not_found(event=event)
@@ -172,10 +216,9 @@ def _patch(event: Mapping[str, Any], user_id: str) -> dict[str, Any]:
         if not row:
             return http.not_found(event=event)
         db.audit(conn, user["id"], "resource.updated", "user", user_id, fields)
-    # Drop any cached ``users`` row globally — we mutated one by primary key,
-    # not by ``cognito_sub``, so the cheapest correct invalidation is to clear
-    # the whole map. Admin-only endpoint; volume is negligible.
-    invalidate_user_cache(None)
+    # No cache invalidation needed: ``_lib.auth`` no longer keeps an in-process
+    # users cache (see its module docstring) — every request re-reads the row
+    # via ``_ensure_user``, so the UPDATE above is immediately visible.
     return http.ok(row, event)
 
 
@@ -235,7 +278,6 @@ def _delete(event: Mapping[str, Any], user_id: str) -> dict[str, Any]:
             return http.not_found(event=event)
         db.audit(conn, caller["id"], "resource.deleted", "user", user_id,
                  {"email": target["email"]})
-    invalidate_user_cache(None)
     return http.no_content(event)
 
 

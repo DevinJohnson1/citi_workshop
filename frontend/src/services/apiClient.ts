@@ -1,6 +1,6 @@
 import { useMemo } from 'react';
 import { useAuth } from 'react-oidc-context';
-import { getAccessToken } from '../auth/session';
+import { getIdToken } from '../auth/session';
 import { isAuthConfigured } from '../auth/oidcConfig';
 
 /** Base URL of the API gateway. Written by `bin/generate-env.sh`. */
@@ -35,53 +35,54 @@ export interface ListResponse<T> {
 export interface ApiClient {
   apiGet:    <T>(path: string) => Promise<T>;
   apiPost:   <T>(path: string, body: unknown) => Promise<T>;
+  apiPut:    <T>(path: string, body: unknown) => Promise<T>;
   apiPatch:  <T>(path: string, body: unknown) => Promise<T>;
   apiDelete: <T = void>(path: string) => Promise<T>;
 }
 
 /**
  * React hook returning a thin, typed `fetch` wrapper that injects the
- * Cognito access token. The workshop login flow stashes the token via
- * `auth/session.ts` (direct InitiateAuth); the OIDC user from
- * `react-oidc-context` is used as a fallback only on real AWS where the
- * Hosted UI is active (`isAuthConfigured = true`).
+ * Cognito **ID token** as the bearer credential.
  *
- * On LocalStack `isAuthConfigured = false` and `<AuthProvider>` is not
- * mounted, so `useAuth()` returns an empty/null context (or throws).
- * The try-catch guards that case; `getAccessToken()` always takes priority
- * so the OIDC fallback is only reached in production.
+ * ## Why the ID token, not the access token
+ *
+ * The Cognito user pool is configured with `username_attributes=["email"]`
+ * (`infra/cognito.tf`). In that mode access tokens carry only the internal
+ * UUID — no `email` claim, no usable identifier for matching workshop
+ * seed personas onto roles. The ID token carries `email` (and `aud` =
+ * client id), so the backend can resolve the caller to a `users` row and
+ * apply the right RBAC. See `backend/_lib/auth.py:verify_token` for the
+ * full reasoning and the security trade-off.
+ *
+ * The workshop login flow (`services/cognito.ts`) puts both tokens into
+ * `auth/session.ts`; we read the ID token via `getIdToken()`. On real AWS
+ * with the Hosted UI active (`isAuthConfigured = true`), we fall back to
+ * `auth.user?.id_token` from `react-oidc-context`.
  *
  * ## Identity stability (read before "optimising" this)
  *
- * The returned object is memoised on `token`, so `apiGet`/`apiPost`/etc.
- * keep referential identity across renders as long as the auth token
- * doesn't change. This matters because every consumer uses these
- * functions as `useEffect` / `useCallback` dependencies — without
- * memoisation, each parent re-render handed back fresh closures, which
- * re-fired every fetch on every render and produced visible
- * loading-spinner flicker (setLoading(true)→fetch→setLoading(false)
- * → render → new closure → fetch again, ad infinitum).
- *
- * If you ever add a new field to the returned object, include any value
- * it closes over in the `useMemo` dependency list — otherwise you'll
- * reintroduce stale-closure bugs (the new field would capture the first
- * render's value forever).
+ * The returned object is memoised on `token`, so `apiGet`/etc. keep
+ * referential identity across renders as long as the auth token doesn't
+ * change. Consumers use these functions as `useEffect` / `useCallback`
+ * dependencies — without memoisation, each parent re-render handed back
+ * fresh closures, which re-fired every fetch on every render and produced
+ * visible loading-spinner flicker.
  */
 export function useApi(): ApiClient {
   // useAuth() is always called to satisfy React's rules of hooks.
   // It is safe because ConditionalAuthProvider always mounts AuthProvider
   // when isAuthConfigured=true. When false (LocalStack), useAuth() may
   // return undefined or throw; we catch that and fall back to session.ts.
-  let oidcAccessToken: string | undefined;
+  let oidcIdToken: string | undefined;
   try {
     const auth = useAuth();
-    oidcAccessToken = isAuthConfigured ? (auth.user?.access_token ?? undefined) : undefined;
+    oidcIdToken = isAuthConfigured ? (auth.user?.id_token ?? undefined) : undefined;
   } catch {
     // No AuthProvider context (LocalStack) — OIDC token not available.
-    oidcAccessToken = undefined;
+    oidcIdToken = undefined;
   }
 
-  const token = getAccessToken() ?? oidcAccessToken;
+  const token = getIdToken() ?? oidcIdToken;
 
   return useMemo<ApiClient>(() => {
     /** Build standard headers; merges caller overrides last. */
@@ -114,7 +115,7 @@ export function useApi(): ApiClient {
         res = await fetch(url, init);
       } catch (err) {
         const cause = err instanceof Error ? err.message : String(err);
-        throw new Error(`Network error calling ${init.method ?? 'GET'} ${url}: ${cause}`);
+        throw new Error(`Network error calling ${init.method ?? 'GET'} ${url}: ${cause}`, { cause: err });
       }
       return handle<T>(res);
     };
@@ -125,6 +126,12 @@ export function useApi(): ApiClient {
       apiPost: <T>(path: string, body: unknown) =>
         doFetch<T>(`${BASE_URL}${path}`, {
           method: 'POST',
+          headers: headers({ 'Content-Type': 'application/json' }),
+          body: JSON.stringify(body),
+        }),
+      apiPut: <T>(path: string, body: unknown) =>
+        doFetch<T>(`${BASE_URL}${path}`, {
+          method: 'PUT',
           headers: headers({ 'Content-Type': 'application/json' }),
           body: JSON.stringify(body),
         }),

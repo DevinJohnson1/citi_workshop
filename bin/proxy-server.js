@@ -81,6 +81,10 @@ const server = http.createServer((req, res) => {
       delete headers['access-control-allow-headers'];
       delete headers['access-control-max-age'];
       res.writeHead(proxyRes.statusCode, headers);
+      proxyRes.on('error', (err) => {
+        console.warn(`[proxy] Cognito upstream response stream error: ${err.code || err.message}`);
+        if (!res.writableEnded) res.end();
+      });
       proxyRes.pipe(res);
     });
     proxyReq.on('error', (err) => {
@@ -242,3 +246,24 @@ server.listen(PORT, () => {
   console.log('==================================================');
   console.log('');
 });
+
+// Surface — and survive — malformed client traffic. Without this handler a
+// stray TCP probe (e.g. a browser racing the proxy's startup, a curl with a
+// bad TLS handshake) crashes the listener.
+server.on('clientError', (err, socket) => {
+  console.warn(`[proxy] Client error: ${err.code || err.message}`);
+  if (socket.writable) socket.end('HTTP/1.1 400 Bad Request\r\n\r\n');
+});
+
+// Last line of defence. If any stream error slips past the per-request
+// handlers above, log it and stay up — a dead proxy turns every subsequent
+// browser fetch into "Failed to fetch", which is exactly the symptom we're
+// trying to eliminate. In production we'd exit and let a supervisor restart;
+// in a workshop dev loop, staying up is the right call.
+process.on('uncaughtException', (err) => {
+  console.error(`[proxy] uncaughtException: ${err.stack || err.message}`);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error(`[proxy] unhandledRejection: ${reason && reason.stack ? reason.stack : reason}`);
+});
+

@@ -1,8 +1,10 @@
 """allocations-service — CRUD on project-level capacity (``allocations``).
 
-Warns on over-allocation (Σ percent > 100 in any overlapping window) but
-never blocks. The reports-service computes the formal over-allocated /
-over-assigned reports.
+Allocations carry a free-text ``role_description`` (e.g. "Backend lead",
+"QA reviewer") plus a date window. Migration 005 dropped the legacy
+``percent`` column; capacity is no longer tracked numerically here. The
+reports-service exposes overlap counts derived from the date windows
+alone.
 
 Approval workflow (added in migration 003): rows carry an
 ``approval_status`` of ``pending``/``approved``/``rejected``. Allocations
@@ -24,7 +26,6 @@ from _lib.auth import AuthError, current_user, handle_auth_errors, verify_token
 from _lib.validation import StrictModel, first_error
 
 _LOG = logging.getLogger()
-_LOG.setLevel(logging.INFO)
 _SERVICE = "allocations-service"
 
 ApprovalStatus = Literal["pending", "approved", "rejected"]
@@ -39,7 +40,7 @@ class AllocationCreate(StrictModel):
 
     user_id: str | None = None
     project_id: str
-    percent: int = Field(ge=1, le=100)
+    role_description: str = Field(default="", max_length=500)
     start_date: date
     end_date: date
 
@@ -47,14 +48,14 @@ class AllocationCreate(StrictModel):
 class AllocationPatch(StrictModel):
     """Body for ``PATCH /api/allocations-service/{id}``."""
 
-    percent: int | None = Field(default=None, ge=1, le=100)
+    role_description: str | None = Field(default=None, max_length=500)
     start_date: date | None = None
     end_date: date | None = None
     approval_status: ApprovalStatus | None = None
 
 
 _PROJECTION = (
-    "id, user_id, project_id, percent, start_date, end_date, created_at, "
+    "id, user_id, project_id, role_description, start_date, end_date, created_at, "
     "approval_status, requested_by, approved_by, approved_at"
 )
 
@@ -142,28 +143,6 @@ def _ensure_lead_can_write(user: dict, project_id: str) -> None:
         raise AuthError(403, "Insufficient role")
 
 
-def _overlap_warning(conn, user_id: str, start: date, end: date, percent: int,
-                     exclude_id: str | None = None) -> int:
-    """Return the max overlapping percent for ``user_id`` across the window."""
-    extra_sql = " AND id <> %s" if exclude_id else ""
-    extra_params: tuple = (exclude_id,) if exclude_id else ()
-    with conn.cursor() as cur:
-        cur.execute(
-            f"""
-            SELECT COALESCE(SUM(percent), 0) AS pct
-            FROM allocations
-            WHERE user_id = %s
-              AND start_date <= %s
-              AND end_date   >= %s
-              AND approval_status = 'approved'
-              {extra_sql}
-            """,
-            (user_id, end, start, *extra_params),
-        )
-        existing = cur.fetchone()["pct"] or 0
-    return int(existing) + percent
-
-
 def _create(event: Mapping[str, Any]) -> dict[str, Any]:
     user = current_user(event)
     body = AllocationCreate(**http.parse_json_body(event))
@@ -193,16 +172,16 @@ def _create(event: Mapping[str, Any]) -> dict[str, Any]:
     approved_at = datetime.now(timezone.utc) if approval_status == "approved" else None
 
     with db.transaction() as conn, conn.cursor() as cur:
-        warning_pct = _overlap_warning(conn, target_user_id, body.start_date,
-                                       body.end_date, body.percent)
         cur.execute(
             f"""
-            INSERT INTO allocations (user_id, project_id, percent, start_date, end_date,
+            INSERT INTO allocations (user_id, project_id, role_description,
+                                     start_date, end_date,
                                      approval_status, requested_by, approved_by, approved_at)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING {_PROJECTION}
             """,
-            (target_user_id, body.project_id, body.percent, body.start_date, body.end_date,
+            (target_user_id, body.project_id, body.role_description,
+             body.start_date, body.end_date,
              approval_status, user["id"], approved_by, approved_at),
         )
         row = cur.fetchone()
@@ -210,11 +189,8 @@ def _create(event: Mapping[str, Any]) -> dict[str, Any]:
                  "allocation.requested" if approval_status == "pending" else "allocation.created",
                  "allocation", row["id"],
                  {"user_id": target_user_id, "project_id": body.project_id,
-                  "overlap_pct": warning_pct, "approval_status": approval_status})
-    payload = dict(row)
-    if warning_pct > 100 and approval_status == "approved":
-        payload["warning"] = f"User over-allocated: total {warning_pct}% in this window"
-    return http.created(payload, event)
+                  "approval_status": approval_status})
+    return http.created(dict(row), event)
 
 
 def _patch(event: Mapping[str, Any], allocation_id: str) -> dict[str, Any]:

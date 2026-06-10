@@ -21,14 +21,19 @@ export function ProjectCreatePage() {
   const [startDate, setStartDate] = useState('');
   const [targetEndDate, setTargetEndDate] = useState('');
   const [ownerId, setOwnerId] = useState('');
+  // Budget is a single number per project. Blank = no ceiling (the
+  // equipment-service budget gate is then disabled for this project).
+  const [budgetAmount, setBudgetAmount] = useState('');
+  const [budgetCurrency, setBudgetCurrency] = useState('USD');
 
   const [owners, setOwners] = useState<User[]>([]);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
+    // Owner dropdown lists team_leads only. Filter is client-side.
     apiGet<ListResponse<User>>('/resources-service')
-      .then((res) => setOwners(res.data))
+      .then((res) => setOwners(res.data.filter((u) => u.role === 'team_lead')))
       .catch((err: Error) => setError(err.message));
   }, [apiGet]);
 
@@ -45,6 +50,8 @@ export function ProjectCreatePage() {
         start_date: startDate || null,
         target_end_date: targetEndDate || null,
         owner_id: ownerId || null,
+        budget_amount: budgetAmount.trim() === '' ? null : budgetAmount,
+        budget_currency: budgetCurrency.toUpperCase(),
       });
       navigate(`/projects/${created.id}`, { replace: true });
     } catch (err) {
@@ -59,8 +66,10 @@ export function ProjectCreatePage() {
       <header>
         <h1 className="text-xl font-semibold">New project</h1>
         <p className="text-sm text-gray-600">
-          As a team lead you own the project shell. Members can then create
-          deliverables and budget entries inside it for your approval.
+          As a team lead you own the project shell, including its singular
+          budget ceiling. Members can then create deliverables and propose
+          equipment (tangibles / intangibles) inside it for your approval —
+          their cost is charged against the budget on assignment.
         </p>
       </header>
 
@@ -123,14 +132,46 @@ export function ProjectCreatePage() {
             onChange={(e) => setOwnerId(e.target.value)}
             className="mt-1 block w-full rounded border border-gray-300 px-2 py-1.5"
           >
-            <option value="">— pick a member —</option>
+            <option value="">— pick a team lead —</option>
             {owners.map((u) => (
               <option key={u.id} value={u.id}>
-                {u.full_name || u.email} ({u.role})
+                {u.full_name || u.email}
               </option>
             ))}
           </select>
         </label>
+
+        {/* Budget — singular ceiling for the whole project. Tangibles and
+            intangibles attached later (from the project's Resources panel,
+            never from the global Resources page) draw against this number.
+            Leaving the amount blank means "no ceiling" — the equipment
+            budget gate is then disabled for this project. */}
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-[1fr,100px]">
+          <label className="text-sm">
+            <span className="text-gray-700">Budget ceiling (optional)</span>
+            <input
+              type="number"
+              min={0}
+              step="0.01"
+              value={budgetAmount}
+              onChange={(e) => setBudgetAmount(e.target.value)}
+              placeholder="Blank = no limit"
+              className="mt-1 block w-full rounded border border-gray-300 px-2 py-1.5 tabular-nums"
+            />
+          </label>
+          <label className="text-sm">
+            <span className="text-gray-700">Currency</span>
+            <input
+              type="text"
+              maxLength={3}
+              value={budgetCurrency}
+              onChange={(e) => setBudgetCurrency(e.target.value)}
+              className="mt-1 block w-full rounded border border-gray-300 px-2 py-1.5 uppercase"
+              aria-label="Currency code"
+              title="Three-letter currency code (USD, EUR, …)"
+            />
+          </label>
+        </div>
 
         {error && (
           <div role="alert" className="rounded border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">

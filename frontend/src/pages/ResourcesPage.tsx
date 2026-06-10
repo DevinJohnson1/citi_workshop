@@ -2,16 +2,18 @@ import { useCallback, useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { useApi, ApiError, type ListResponse } from '../services/apiClient';
 import { useRole } from '../auth/useRole';
+import { OverworkBadge } from '../components/OverworkBadge';
 import type {
   ApprovalStatus,
   Deliverable,
   Equipment,
   EquipmentStatus,
+  Project,
   ResourceKind,
   User,
 } from '../types/api';
 
-type Tab = Extract<ResourceKind, 'people' | 'deliverables' | 'equipment'>;
+type Tab = Extract<ResourceKind, 'people' | 'deliverables' | 'tangibles' | 'intangibles'>;
 interface TabSpec {
   key: Tab;
   label: string;
@@ -21,34 +23,39 @@ interface TabSpec {
 /** Resource tabs surfaced to every signed-in user (read-only by default). */
 const TABS: TabSpec[] = [
   { key: 'people', label: 'People', description: 'All team members, leads, and admins.' },
-  { key: 'deliverables', label: 'Deliverables', description: 'Work products across all projects.' },
-  { key: 'equipment', label: 'Equipment', description: 'Tangible assets — any kind (laptops, vehicles, licenses, rooms, anything else you track).' },
+  {
+    key: 'deliverables',
+    label: 'Deliverables',
+    // Deliverables are project-scoped — they can only be created from inside a
+    // project. This tab is a read-only cross-project rollup; the inline hint
+    // inside DeliverablesTab tells users where to go to add one.
+    description: 'Cross-project rollup of work products. Read-only — open a project to add or edit deliverables.',
+  },
+  {
+    key: 'tangibles',
+    label: 'Tangibles',
+    description: 'Physical assets you can carry, plug in, drive, or sit at — laptops, vehicles, monitors, rooms, anything else with a physical presence.',
+  },
+  {
+    key: 'intangibles',
+    label: 'Intangibles',
+    description: 'Non-physical resources: software licenses, SaaS subscriptions, certifications, training credits, API quotas.',
+  },
 ];
 
-/**
- * Common "seed" suggestions surfaced via a datalist. These are *hints*, not
- * constraints — the backend accepts any non-empty short label and the schema
- * has no CHECK constraint on `equipment.kind` (see migration 003).
- */
-const COMMON_EQUIPMENT_KINDS = [
-  'laptop',
-  'vehicle',
-  'license',
-  'room',
-  'monitor',
-  'phone',
-  'tablet',
-  'camera',
-  'tool',
-  'other',
-];
+/** Kind input is free-form — no autocomplete suggestions are surfaced. */
 
 const EQUIPMENT_STATUSES: EquipmentStatus[] = ['available', 'in_use', 'maintenance', 'retired'];
 
 /**
- * Resources hub. The project models four kinds of resource (people,
- * deliverables, equipment, budget); this page surfaces the first three as
- * tabs. Budget is project-scoped so it lives under each project's detail.
+ * Resources hub. The project tracks five kinds of resource (people,
+ * deliverables, tangibles, intangibles, budget); this page surfaces the
+ * first four as tabs. Budget is project-scoped so it lives under each
+ * project's detail.
+ *
+ * Tangibles and intangibles share the `equipment` table — distinguished by
+ * the `is_tangible` flag added in migration 004 — so they reuse the same
+ * `EquipmentTab` component, parameterised by `isTangible`.
  *
  * All signed-in roles may read every tab so team members and viewers can see
  * who's on the team and what's available. Writes follow per-tab RBAC
@@ -89,7 +96,8 @@ export function ResourcesPage() {
       <div role="tabpanel">
         {tab === 'people' && <PeopleTab />}
         {tab === 'deliverables' && <DeliverablesTab />}
-        {tab === 'equipment' && <EquipmentTab />}
+        {tab === 'tangibles' && <EquipmentTab isTangible={true} />}
+        {tab === 'intangibles' && <EquipmentTab isTangible={false} />}
       </div>
     </section>
   );
@@ -125,19 +133,31 @@ function PeopleTab() {
               <th scope="col" className="px-3 py-2">Job title</th>
               <th scope="col" className="px-3 py-2">Role</th>
               <th scope="col" className="px-3 py-2">Weekly hours</th>
+              <th scope="col" className="px-3 py-2 text-right" title="Distinct projects with an approved allocation">Projects</th>
+              <th scope="col" className="px-3 py-2 text-right" title="Open assignments (not yet completed) across all deliverables">Open deliverables</th>
+              <th scope="col" className="px-3 py-2">Workload</th>
             </tr>
           </thead>
           <tbody>
             {rows.length === 0 && (
-              <tr><td colSpan={5} className="px-3 py-4 text-gray-500">No allocatable users.</td></tr>
+              <tr><td colSpan={8} className="px-3 py-4 text-gray-500">No allocatable users.</td></tr>
             )}
             {rows.map((u) => (
               <tr key={u.id} className="border-t border-gray-100">
-                <td className="px-3 py-2">{u.full_name || '—'}</td>
+                <td className="px-3 py-2">
+                  {u.full_name || '—'}
+                </td>
                 <td className="px-3 py-2">{u.email}</td>
                 <td className="px-3 py-2">{u.job_title || '—'}</td>
                 <td className="px-3 py-2"><span className="rounded bg-gray-100 px-1.5 py-0.5 text-xs">{u.role}</span></td>
                 <td className="px-3 py-2">{u.weekly_capacity_hours}</td>
+                <td className="px-3 py-2 text-right tabular-nums">{u.active_project_count ?? '—'}</td>
+                <td className="px-3 py-2 text-right tabular-nums">{u.active_deliverable_count ?? '—'}</td>
+                <td className="px-3 py-2">
+                  {u.is_overworked
+                    ? <OverworkBadge user={u} />
+                    : <span className="text-xs text-gray-400">ok</span>}
+                </td>
               </tr>
             ))}
           </tbody>
@@ -165,38 +185,46 @@ function DeliverablesTab() {
   }, [apiGet]);
 
   return (
-    <div className="overflow-x-auto rounded border border-gray-200 bg-white">
-      {loading && <p className="px-3 py-2 text-sm text-gray-500">Loading…</p>}
-      {error && <p className="px-3 py-2 text-sm text-red-600">{error}</p>}
-      {!loading && !error && (
-        <table className="min-w-full text-sm">
-          <thead className="bg-gray-50 text-left text-gray-700">
-            <tr>
-              <th scope="col" className="px-3 py-2">Title</th>
-              <th scope="col" className="px-3 py-2">Status</th>
-              <th scope="col" className="px-3 py-2">Due</th>
-              <th scope="col" className="px-3 py-2">Project</th>
-            </tr>
-          </thead>
-          <tbody>
-            {rows.length === 0 && (
-              <tr><td colSpan={4} className="px-3 py-4 text-gray-500">No deliverables.</td></tr>
-            )}
-            {rows.map((d) => (
-              <tr key={d.id} className="border-t border-gray-100">
-                <td className="px-3 py-2">{d.title}</td>
-                <td className="px-3 py-2">{d.status}</td>
-                <td className="px-3 py-2">{d.due_date ?? '—'}</td>
-                <td className="px-3 py-2">
-                  <Link to={`/projects/${d.project_id}`} className="text-brand-700 hover:underline">
-                    Open
-                  </Link>
-                </td>
+    <div className="space-y-3">
+      {/* Pointer to where deliverables actually get created — this tab is a
+          read-only rollup, easy to mistake for a CRUD surface. */}
+      <p className="rounded border border-blue-200 bg-blue-50 px-3 py-2 text-xs text-blue-900">
+        Deliverables live inside a project. To add or edit one, open a project
+        from the <Link to="/projects" className="font-medium underline">Projects</Link> list and use the Deliverables section there.
+      </p>
+      <div className="overflow-x-auto rounded border border-gray-200 bg-white">
+        {loading && <p className="px-3 py-2 text-sm text-gray-500">Loading…</p>}
+        {error && <p className="px-3 py-2 text-sm text-red-600">{error}</p>}
+        {!loading && !error && (
+          <table className="min-w-full text-sm">
+            <thead className="bg-gray-50 text-left text-gray-700">
+              <tr>
+                <th scope="col" className="px-3 py-2">Title</th>
+                <th scope="col" className="px-3 py-2">Status</th>
+                <th scope="col" className="px-3 py-2">Due</th>
+                <th scope="col" className="px-3 py-2">Project</th>
               </tr>
-            ))}
-          </tbody>
-        </table>
-      )}
+            </thead>
+            <tbody>
+              {rows.length === 0 && (
+                <tr><td colSpan={4} className="px-3 py-4 text-gray-500">No deliverables yet — create one from a project page.</td></tr>
+              )}
+              {rows.map((d) => (
+                <tr key={d.id} className="border-t border-gray-100">
+                  <td className="px-3 py-2">{d.title}</td>
+                  <td className="px-3 py-2">{d.status}</td>
+                  <td className="px-3 py-2">{d.due_date ?? '—'}</td>
+                  <td className="px-3 py-2">
+                    <Link to={`/projects/${d.project_id}`} className="text-brand-700 hover:underline">
+                      Open
+                    </Link>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
     </div>
   );
 }
@@ -205,7 +233,7 @@ function DeliverablesTab() {
 // Equipment
 // ---------------------------------------------------------------------------
 
-function EquipmentTab() {
+function EquipmentTab({ isTangible }: { isTangible: boolean }) {
   const { apiGet, apiPost, apiPatch, apiDelete } = useApi();
   const role = useRole();
   const canWrite = role === 'admin' || role === 'team_lead';
@@ -213,31 +241,38 @@ function EquipmentTab() {
   const canApprove = canWrite;
   const canDelete = role === 'admin';
 
+  const noun = isTangible ? 'tangible' : 'intangible';
+  const Noun = isTangible ? 'Tangible' : 'Intangible';
+
   const [rows, setRows] = useState<Equipment[]>([]);
-  const [knownKinds, setKnownKinds] = useState<string[]>([]);
+  const [projects, setProjects] = useState<Project[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
   const [name, setName] = useState('');
   const [kind, setKind] = useState('');
   const [status, setStatus] = useState<EquipmentStatus>('available');
+  const [cost, setCost] = useState('');
+  const [currency, setCurrency] = useState('USD');
   const [submitting, setSubmitting] = useState(false);
 
   const reload = useCallback(() => {
     setLoading(true);
+    // is_tangible filter scopes the list to one tab. Projects are fetched
+    // only to resolve assigned_project_id → project name in the read-only
+    // "Project" column. Equipment is assigned to a project from inside the
+    // project's own Resources panel, never from this page.
     Promise.all([
-      apiGet<ListResponse<Equipment>>('/equipment-service?limit=100'),
-      apiGet<{ data: string[] }>('/equipment-service/kinds').catch(() => ({ data: [] as string[] })),
+      apiGet<ListResponse<Equipment>>(`/equipment-service?is_tangible=${isTangible}&limit=100`),
+      apiGet<ListResponse<Project>>('/projects-service?limit=100').catch(() => ({ data: [] as Project[], meta: { total: 0, limit: 0, offset: 0 } })),
     ])
-      .then(([res, kinds]) => {
+      .then(([res, projs]) => {
         setRows(res.data);
-        // Merge historical kinds with the common-suggestion hints, dedupe + sort.
-        const merged = Array.from(new Set([...kinds.data, ...COMMON_EQUIPMENT_KINDS])).sort();
-        setKnownKinds(merged);
+        setProjects(projs.data);
       })
       .catch((err: Error) => setError(err.message))
       .finally(() => setLoading(false));
-  }, [apiGet]);
+  }, [apiGet, isTangible]);
 
   useEffect(() => {
     reload();
@@ -248,14 +283,26 @@ function EquipmentTab() {
     setSubmitting(true);
     setError(null);
     try {
-      await apiPost<Equipment>('/equipment-service', {
+      // Empty string → omit. Cost is a string in the form input so we send
+      // it as a number when present. Equipment is created here unassigned;
+      // attach it to a project from inside that project's Resources panel,
+      // where the budget gate runs against the project's remaining budget.
+      const body: Record<string, unknown> = {
         name: name.trim(),
         kind: kind.trim(),
         status,
-      });
+        is_tangible: isTangible,
+      };
+      if (cost.trim()) {
+        body.cost = Number(cost);
+        body.currency = currency.toUpperCase();
+      }
+      await apiPost<Equipment>('/equipment-service', body);
       setName('');
       setKind('');
       setStatus('available');
+      setCost('');
+      setCurrency('USD');
       reload();
     } catch (err) {
       setError(err instanceof ApiError ? err.message : (err as Error).message);
@@ -286,6 +333,8 @@ function EquipmentTab() {
 
   const canCreate = canWrite || canSelfRequest;
   const submitLabel = canSelfRequest ? 'Submit for approval' : 'Add';
+  const projectById = (id: string | null): Project | undefined =>
+    id ? projects.find((p) => p.id === id) : undefined;
 
   return (
     <div className="space-y-4">
@@ -300,13 +349,16 @@ function EquipmentTab() {
                 <th scope="col" className="px-3 py-2">Kind</th>
                 <th scope="col" className="px-3 py-2">Status</th>
                 <th scope="col" className="px-3 py-2">Approval</th>
-                <th scope="col" className="px-3 py-2">Serial</th>
+                <th scope="col" className="px-3 py-2">Cost</th>
+                <th scope="col" className="px-3 py-2">Project</th>
                 {(canApprove || canDelete) && <th scope="col" className="px-3 py-2">Actions</th>}
               </tr>
             </thead>
             <tbody>
               {rows.length === 0 && (
-                <tr><td colSpan={canApprove || canDelete ? 6 : 5} className="px-3 py-4 text-gray-500">No equipment recorded.</td></tr>
+                <tr><td colSpan={canApprove || canDelete ? 7 : 6} className="px-3 py-4 text-gray-500">
+                  No {noun} resources recorded.
+                </td></tr>
               )}
               {rows.map((e) => {
                 const pending = e.approval_status === 'pending';
@@ -316,6 +368,7 @@ function EquipmentTab() {
                   : rejected
                     ? 'bg-red-100 text-red-700'
                     : 'bg-emerald-100 text-emerald-800';
+                const proj = projectById(e.assigned_project_id);
                 return (
                   <tr key={e.id} className="border-t border-gray-100">
                     <td className="px-3 py-2">{e.name}</td>
@@ -324,7 +377,18 @@ function EquipmentTab() {
                     <td className="px-3 py-2">
                       <span className={`rounded px-1.5 py-0.5 text-xs ${badge}`}>{e.approval_status}</span>
                     </td>
-                    <td className="px-3 py-2">{e.serial_number ?? '—'}</td>
+                    <td className="px-3 py-2 tabular-nums">
+                      {e.cost != null ? `${e.cost} ${e.currency}` : <span className="text-gray-400">—</span>}
+                    </td>
+                    <td className="px-3 py-2">
+                      {proj ? (
+                        <Link to={`/projects/${proj.id}`} className="text-brand-700 hover:underline">
+                          {proj.name}
+                        </Link>
+                      ) : (
+                        <span className="text-gray-400">—</span>
+                      )}
+                    </td>
                     {(canApprove || canDelete) && (
                       <td className="px-3 py-2">
                         <div className="flex flex-wrap gap-1">
@@ -369,41 +433,61 @@ function EquipmentTab() {
       {canCreate && (
         <form
           onSubmit={(e) => void handleCreate(e)}
-          className={`grid grid-cols-1 gap-2 rounded border border-dashed p-3 sm:grid-cols-[1fr,160px,140px,auto] ${canSelfRequest ? 'border-amber-300 bg-amber-50' : 'border-gray-300'}`}
+          className={`flex flex-wrap items-start gap-2 rounded border border-dashed p-3 ${canSelfRequest ? 'border-amber-300 bg-amber-50' : 'border-gray-300'}`}
         >
           <input
             required
             maxLength={200}
             value={name}
             onChange={(e) => setName(e.target.value)}
-            placeholder={canSelfRequest ? 'Propose an asset (e.g. MacBook Pro 14)…' : 'Equipment name (e.g. MacBook Pro 14)'}
-            className="rounded border border-gray-300 px-2 py-1.5 text-sm"
+            placeholder={
+              canSelfRequest
+                ? `Propose a ${noun} (e.g. ${isTangible ? 'MacBook Pro 14' : 'Figma seat'})…`
+                : `${Noun} name (e.g. ${isTangible ? 'MacBook Pro 14' : 'Figma seat'})`
+            }
+            className="min-w-48 flex-[2_1_14rem] rounded border border-gray-300 px-2 py-1.5 text-sm"
           />
           <input
             required
-            list="equipment-kind-suggestions"
             maxLength={80}
             value={kind}
             onChange={(e) => setKind(e.target.value)}
-            placeholder="kind (free-form — e.g. laptop, forklift, sw_license)"
-            className="rounded border border-gray-300 px-2 py-1.5 text-sm"
-            aria-label="Equipment kind"
+            placeholder={`kind (free-form — e.g. ${isTangible ? 'laptop, forklift' : 'software_license, certification'})`}
+            className="min-w-40 flex-1 rounded border border-gray-300 px-2 py-1.5 text-sm"
+            aria-label={`${Noun} kind`}
           />
-          <datalist id="equipment-kind-suggestions">
-            {knownKinds.map((k) => <option key={k} value={k} />)}
-          </datalist>
           <select
             value={status}
             onChange={(e) => setStatus(e.target.value as EquipmentStatus)}
-            className="rounded border border-gray-300 px-2 py-1.5 text-sm"
-            aria-label="Equipment status"
+            className="min-w-32 flex-none rounded border border-gray-300 px-2 py-1.5 text-sm"
+            aria-label={`${Noun} status`}
           >
             {EQUIPMENT_STATUSES.map((s) => <option key={s} value={s}>{s}</option>)}
           </select>
+          <input
+            type="number"
+            min={0}
+            step="0.01"
+            value={cost}
+            onChange={(e) => setCost(e.target.value)}
+            placeholder="Cost"
+            className="w-28 flex-none rounded border border-gray-300 px-2 py-1.5 text-sm tabular-nums"
+            aria-label="Cost"
+          />
+          <input
+            type="text"
+            maxLength={3}
+            value={currency}
+            onChange={(e) => setCurrency(e.target.value)}
+            placeholder="USD"
+            className="w-20 flex-none rounded border border-gray-300 px-2 py-1.5 text-sm uppercase"
+            aria-label="Currency code"
+            title="Three-letter currency code (USD, EUR, …)"
+          />
           <button
             type="submit"
             disabled={submitting || !name.trim() || !kind.trim()}
-            className={`rounded px-3 py-1.5 text-sm font-medium text-white disabled:cursor-not-allowed disabled:opacity-50 ${canSelfRequest ? 'bg-amber-600 hover:bg-amber-700' : 'bg-brand-600 hover:bg-brand-700'}`}
+            className={`w-full rounded px-3 py-1.5 text-sm font-medium text-white disabled:cursor-not-allowed disabled:opacity-50 sm:w-auto ${canSelfRequest ? 'bg-amber-600 hover:bg-amber-700' : 'bg-brand-600 hover:bg-brand-700'}`}
           >
             {submitLabel}
           </button>

@@ -20,8 +20,14 @@ from _lib import db, http
 from _lib.auth import AuthError, handle_auth_errors, verify_token
 
 _LOG = logging.getLogger()
-_LOG.setLevel(logging.INFO)
 _SERVICE = "reports-service"
+
+# Workload thresholds for the over-assigned ("overworked") report. Kept in
+# lock-step with the same constants in resources-service so the per-user
+# `is_overworked` flag and this org-wide rollup never disagree. A user is
+# over-assigned when EITHER threshold is exceeded.
+_OVERWORK_PROJECT_THRESHOLD = 3
+_OVERWORK_DELIVERABLE_THRESHOLD = 10
 
 
 def handler(event: Mapping[str, Any], context: Any = None) -> dict[str, Any]:
@@ -75,66 +81,131 @@ def _rows(sql: str, params: tuple = ()) -> list[dict[str, Any]]:
 
 
 def _at_risk() -> dict[str, Any]:
-    """Projects whose target_end_date < today+14 and status not done/cancelled."""
+    """Projects flagged "at risk" because they own at least one outdated deliverable.
+
+    A deliverable is outdated when its ``due_date`` has passed and it isn't
+    ``done`` / ``cancelled``. A project is at risk when it owns any such
+    deliverable AND it is still in flight — status is ``planned``, ``active``
+    or ``on_hold``. Projects that are ``done`` or ``cancelled`` are never
+    at-risk, regardless of dangling deliverables.
+    The response includes ``outdated_count`` so the dashboard can show
+    severity at a glance.
+    """
     data = _rows(
         """
-        SELECT id, name, status, target_end_date, owner_id
-        FROM projects
-        WHERE target_end_date < (CURRENT_DATE + INTERVAL '14 days')
-          AND status NOT IN ('done','cancelled')
-        ORDER BY target_end_date NULLS LAST
+        SELECT p.id, p.name, p.status, p.target_end_date, p.owner_id,
+               COUNT(d.id) AS outdated_count
+        FROM projects p
+        JOIN deliverables d ON d.project_id = p.id
+        WHERE p.status IN ('planned','active','on_hold')
+          AND d.due_date IS NOT NULL
+          AND d.due_date < CURRENT_DATE
+          AND d.status NOT IN ('done','cancelled')
+        GROUP BY p.id, p.name, p.status, p.target_end_date, p.owner_id
+        ORDER BY outdated_count DESC, p.target_end_date NULLS LAST
         """
     )
     return {"data": data}
 
 
 def _over_allocated() -> dict[str, Any]:
-    """Users whose summed `allocations.percent` exceeds 100 in any overlapping window.
+    """Users with more than one *approved* allocation whose date windows overlap.
 
-    Uses self-join: for every allocation A, sum percent of allocations whose
-    window overlaps A's. Returns rows where the rolling total > 100.
+    Migration 005 dropped ``allocations.percent``, so capacity is no longer
+    tracked numerically. This report now answers the structural question
+    "is anyone double-booked at all?" — for every approved allocation A we
+    count approved allocations on the same user whose window overlaps A's,
+    and surface users where that peak overlap count exceeds 1.
     """
     data = _rows(
         """
         SELECT u.id AS user_id, u.email, u.full_name,
-               MAX(overlap.total_pct) AS peak_pct
+               MAX(overlap.overlap_count) AS peak_overlap
         FROM users u
-        JOIN allocations a ON a.user_id = u.id
+        JOIN allocations a ON a.user_id = u.id AND a.approval_status = 'approved'
         JOIN LATERAL (
-            SELECT SUM(a2.percent) AS total_pct
+            SELECT COUNT(*) AS overlap_count
             FROM allocations a2
             WHERE a2.user_id = a.user_id
+              AND a2.approval_status = 'approved'
               AND a2.start_date <= a.end_date
               AND a2.end_date   >= a.start_date
         ) overlap ON TRUE
         GROUP BY u.id, u.email, u.full_name
-        HAVING MAX(overlap.total_pct) > 100
-        ORDER BY peak_pct DESC
+        HAVING MAX(overlap.overlap_count) > 1
+        ORDER BY peak_overlap DESC
         """
     )
     return {"data": data}
 
 
 def _over_assigned() -> dict[str, Any]:
-    """Users whose open assignments sum to > 100% (independent of allocations)."""
+    """Users who are *over-assigned* by the workload-thresholds rule.
+
+    A user is over-assigned when EITHER
+
+      * the number of distinct projects they hold at least one approved
+        allocation on exceeds ``_OVERWORK_PROJECT_THRESHOLD`` (default 3), OR
+      * the number of open assignments they hold across every deliverable
+        (``completed_at IS NULL``) exceeds
+        ``_OVERWORK_DELIVERABLE_THRESHOLD`` (default 10).
+
+    This rule replaces the legacy ``SUM(assignments.percent) > 100`` check
+    which became meaningless after migration 005 dropped a uniform notion of
+    "100% capacity" from allocations. The same thresholds are computed
+    per-user in resources-service as ``is_overworked`` so pickers and
+    rosters can show the warning inline; this endpoint is the org-wide
+    rollup that powers the Reports page.
+    """
     data = _rows(
-        """
-        SELECT u.id AS user_id, u.email, u.full_name,
-               SUM(a.percent) AS total_pct,
-               COUNT(*) AS open_assignments
-        FROM assignments a
-        JOIN users u ON u.id = a.user_id
-        WHERE a.completed_at IS NULL
-        GROUP BY u.id, u.email, u.full_name
-        HAVING SUM(a.percent) > 100
-        ORDER BY total_pct DESC
+        f"""
+        WITH workload AS (
+            SELECT
+                u.id    AS user_id,
+                u.email,
+                u.full_name,
+                COALESCE((
+                    SELECT COUNT(DISTINCT project_id)
+                    FROM allocations
+                    WHERE user_id = u.id AND approval_status = 'approved'
+                ), 0) AS active_project_count,
+                COALESCE((
+                    SELECT COUNT(*)
+                    FROM assignments
+                    WHERE user_id = u.id AND completed_at IS NULL
+                ), 0) AS active_deliverable_count
+            FROM users u
+            WHERE u.role IN ('team_lead','team_member')
+        )
+        SELECT
+            user_id,
+            email,
+            full_name,
+            active_project_count,
+            active_deliverable_count,
+            (active_project_count     > {_OVERWORK_PROJECT_THRESHOLD})     AS exceeds_project_threshold,
+            (active_deliverable_count > {_OVERWORK_DELIVERABLE_THRESHOLD}) AS exceeds_deliverable_threshold
+        FROM workload
+        WHERE active_project_count     > {_OVERWORK_PROJECT_THRESHOLD}
+           OR active_deliverable_count > {_OVERWORK_DELIVERABLE_THRESHOLD}
+        ORDER BY active_deliverable_count DESC, active_project_count DESC
         """
     )
-    return {"data": data}
+    return {
+        "data": data,
+        "meta": {
+            "project_threshold":     _OVERWORK_PROJECT_THRESHOLD,
+            "deliverable_threshold": _OVERWORK_DELIVERABLE_THRESHOLD,
+        },
+    }
 
 
 def _allocation_by_user(qs: dict[str, str]) -> dict[str, Any]:
-    """Rolls up allocations per user, optionally bounded by ``user_id`` / window."""
+    """Rolls up allocations per user, optionally bounded by ``user_id`` / window.
+
+    Capacity used to be reported as ``SUM(percent)``; migration 005 dropped
+    that column, so this now returns just the allocation count per user.
+    """
     where = []
     params: list[Any] = []
     if uid := qs.get("user_id"):
@@ -147,13 +218,12 @@ def _allocation_by_user(qs: dict[str, str]) -> dict[str, Any]:
     data = _rows(
         f"""
         SELECT u.id AS user_id, u.email, u.full_name,
-               COUNT(*) AS allocation_count,
-               COALESCE(SUM(a.percent), 0) AS total_pct
+               COUNT(a.id) AS allocation_count
         FROM users u
         LEFT JOIN allocations a ON a.user_id = u.id
         {where_sql}
         GROUP BY u.id, u.email, u.full_name
-        ORDER BY total_pct DESC, u.email
+        ORDER BY allocation_count DESC, u.email
         """,
         tuple(params),
     )
@@ -193,20 +263,27 @@ def _deliverable_completion(project_id: str | None) -> dict[str, Any]:
 
 
 def _budget_vs_planned() -> dict[str, Any]:
-    """Per-project planned vs consumed totals."""
+    """Per-project planned vs consumed totals.
+
+    ``planned`` is the project's singular ``budget_amount`` (NULL when no
+    ceiling has been set — surfaced as 0 so the column still sorts). The
+    ``consumed`` figure is the sum of ``equipment.cost`` for every approved
+    or pending tangible/intangible assigned to the project — the only thing
+    that draws against the budget in this data model.
+    """
     data = _rows(
         """
         SELECT p.id AS project_id, p.name,
-               COALESCE(SUM(bp.amount_planned), 0)::numeric(14,2) AS planned,
+               COALESCE(p.budget_amount, 0)::numeric(14,2) AS planned,
                COALESCE((
-                   SELECT SUM(be.amount)
-                   FROM budget_entries be
-                   JOIN budget_plans bp2 ON bp2.id = be.budget_plan_id
-                   WHERE bp2.project_id = p.id
-               ), 0)::numeric(14,2) AS consumed
+                   SELECT SUM(e.cost)
+                   FROM equipment e
+                   WHERE e.assigned_project_id = p.id
+                     AND e.cost IS NOT NULL
+                     AND e.approval_status IN ('approved', 'pending')
+               ), 0)::numeric(14,2) AS consumed,
+               p.budget_currency AS currency
         FROM projects p
-        LEFT JOIN budget_plans bp ON bp.project_id = p.id
-        GROUP BY p.id, p.name
         ORDER BY p.name
         """
     )

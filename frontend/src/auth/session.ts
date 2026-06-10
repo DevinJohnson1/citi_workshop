@@ -82,6 +82,21 @@ export function getAccessToken(): string | null {
   return getSession()?.accessToken ?? null;
 }
 
+/**
+ * Convenience: the ID token, or `null` when signed out.
+ *
+ * The SPA uses the ID token (not the access token) as the bearer credential
+ * on backend API calls — Cognito access tokens don't carry the ``email``
+ * claim and our pool's ``username_attributes=["email"]`` config makes the
+ * ``username`` claim a UUID, so the access token cannot identify a workshop
+ * persona. The backend (``backend/_lib/auth.py:verify_token``) validates
+ * the ID token's signature, issuer, audience, and ``token_use="id"`` on
+ * every request — see the docstring there for the security trade-off.
+ */
+export function getIdToken(): string | null {
+  return getSession()?.idToken ?? null;
+}
+
 /** Convenience: the caller's role, or `null` when signed out. */
 export function getRole(): SessionRole | null {
   return getSession()?.role ?? null;

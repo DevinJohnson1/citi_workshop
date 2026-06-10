@@ -188,15 +188,44 @@ for req in "$PROJECT_ROOT"/backend/*/requirements.txt; do
     [[ "$(basename "$svc_dir")" == _* ]] && continue
     REQS_HASH=$(md5sum "$req" 2>/dev/null | cut -d' ' -f1)
     HASH_FILE="$svc_dir/.pip_installed"
+
+    # Skip when the manifest is unchanged since the last successful install.
     if [ "$(cat "$HASH_FILE" 2>/dev/null)" = "$REQS_HASH" ]; then
         continue
     fi
+
+    # Manifest changed (or never installed). Do a CLEAN reinstall: wipe every
+    # top-level entry in the service dir except the things we authored, then
+    # let pip resolve the new set from scratch. This guarantees that any
+    # package removed from requirements.txt — including its transitive deps
+    # that no other package still pulls in — disappears from the service dir.
+    # In-place `pip install --upgrade` would leave orphans behind because
+    # pip --target has no garbage collector.
+    #
+    # The wipe runs INSIDE the same docker image as pip, because pip wrote
+    # those files as root (container UID 0) into the bind mount; a host-side
+    # `rm` would fail with EACCES. Same image → same UID → rm works.
+    if compgen -G "$svc_dir/*.dist-info" >/dev/null 2>&1; then
+        echo "  Pruning previous deps in $(basename "$svc_dir") before reinstall..."
+        docker run --rm \
+            -v "$svc_dir":/var/task \
+            --entrypoint /bin/sh \
+            "$PIP_IMAGE" \
+            -c 'find /var/task -mindepth 1 -maxdepth 1 \
+                  ! -name function.py \
+                  ! -name requirements.txt \
+                  ! -name _lib \
+                  ! -name .pip_installed \
+                  -exec rm -rf {} +' \
+          || { echo "  ✗ prune failed for $(basename "$svc_dir")"; exit 1; }
+    fi
+
     echo "  Installing pip requirements for $(basename "$svc_dir") (docker / python3.11)..."
     docker run --rm \
         -v "$svc_dir":/var/task \
         --entrypoint /bin/sh \
         "$PIP_IMAGE" \
-        -c 'pip install --quiet --upgrade --target=/var/task -r /var/task/requirements.txt' \
+        -c 'pip install --quiet --target=/var/task -r /var/task/requirements.txt' \
       || { echo "  ✗ pip install failed for $(basename "$svc_dir")"; exit 1; }
     echo "$REQS_HASH" > "$HASH_FILE"
 done

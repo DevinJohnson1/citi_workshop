@@ -35,36 +35,28 @@ locals {
       handler = "function.handler"
       path    = abspath(format("%s/../backend/%s", path.module, name))
       # Exclude pip-install artifacts (vendored deps that bin/start-dev.sh
-      # installs into each service dir for LocalStack hot-reload) from the AWS
-      # deployment zip. The Lambda module reinstalls them fresh via
-      # build_in_docker + pip_requirements, so shipping the local copies would
-      # be redundant and could mask Linux/x86_64 wheel mismatches if the dev
-      # ran pip on a non-Lambda platform.
+      # installs into each service dir for LocalStack hot-reload). The Lambda
+      # module reinstalls them fresh via build_in_docker + pip_requirements,
+      # so shipping the local copies would mask Linux/x86_64 wheel mismatches.
+      # Patterns are gitignore-style; `!` excludes. Generic wildcards catch
+      # all dist-info dirs, hidden files, pycache, and compiled extensions;
+      # the named-package list covers top-level vendored package dirs.
       patterns = [
         "!__pycache__/.*",
         "!\\..*",
+        "!.*\\.dist-info/.*",
+        "!.*\\.so",
         "!annotated_types/.*",
-        "!annotated_types-.*\\.dist-info/.*",
         "!cffi/.*",
-        "!cffi-.*\\.dist-info/.*",
-        "!_cffi_backend.*\\.so",
         "!cryptography/.*",
-        "!cryptography-.*\\.dist-info/.*",
         "!jwt/.*",
-        "!PyJWT-.*\\.dist-info/.*",
         "!psycopg/.*",
-        "!psycopg-.*\\.dist-info/.*",
         "!psycopg_binary/.*",
-        "!psycopg_binary-.*\\.dist-info/.*",
         "!psycopg_binary\\.libs/.*",
         "!pycparser/.*",
-        "!pycparser-.*\\.dist-info/.*",
         "!pydantic/.*",
-        "!pydantic-.*\\.dist-info/.*",
         "!pydantic_core/.*",
-        "!pydantic_core-.*\\.dist-info/.*",
         "!typing_extensions\\.py",
-        "!typing_extensions-.*\\.dist-info/.*",
       ]
       pip_requirements = true
     }
@@ -114,10 +106,10 @@ locals {
       ? "workshop-localstack"
       : try(element(aws_rds_cluster.this.*.endpoint, 0), "")
     ) : coalesce(try(trimspace(var.aws_postgres_host), ""), "postgres")
-    POSTGRES_PORT = var.aws_postgres_enabled ? tostring(try(element(aws_rds_cluster.this.*.port, 0), 5432)) : "5432"
-    POSTGRES_NAME = var.aws_postgres_enabled ? try(element(aws_rds_cluster.this.*.database_name, 0), replace(var.aws_project, "-", "")) : "postgres"
-    POSTGRES_USER = var.aws_postgres_enabled ? try(element(aws_rds_cluster.this.*.master_username, 0), "superadmin") : "postgres"
-    POSTGRES_PASS = var.aws_postgres_enabled ? try(element(aws_rds_cluster.this.*.master_password, 0), "") : "postgres123"
+    POSTGRES_PORT        = var.aws_postgres_enabled ? tostring(try(element(aws_rds_cluster.this.*.port, 0), 5432)) : "5432"
+    POSTGRES_NAME        = var.aws_postgres_enabled ? try(element(aws_rds_cluster.this.*.database_name, 0), replace(var.aws_project, "-", "")) : "postgres"
+    POSTGRES_USER        = var.aws_postgres_enabled ? try(element(aws_rds_cluster.this.*.master_username, 0), "superadmin") : "postgres"
+    POSTGRES_PASS        = var.aws_postgres_enabled ? try(element(aws_rds_cluster.this.*.master_password, 0), "") : "postgres123"
     COGNITO_USER_POOL_ID = local.cognito_enabled ? try(element(aws_cognito_user_pool.this.*.id, 0), "") : ""
     COGNITO_CLIENT_ID    = local.cognito_enabled ? try(element(aws_cognito_user_pool_client.this.*.id, 0), "") : ""
     # COGNITO_ISSUER_URL must match the `iss` claim that the IdP actually puts

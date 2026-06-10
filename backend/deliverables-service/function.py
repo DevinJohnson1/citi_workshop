@@ -17,9 +17,22 @@ from _lib.auth import AuthError, current_user, handle_auth_errors, verify_token
 from _lib.validation import DeliverableStatus, StrictModel, first_error
 
 _LOG = logging.getLogger()
-_LOG.setLevel(logging.INFO)
 _SERVICE = "deliverables-service"
 _STATUS: frozenset[str] = frozenset(get_args(DeliverableStatus))
+
+# A deliverable is "outdated" when its due date has passed and the work is
+# neither complete nor cancelled. Computed on every read so the flag stays in
+# lock-step with ``CURRENT_DATE`` without any nightly job. Kept as a SQL
+# expression (rather than a stored column) because it depends on "today" —
+# materialising it would force a row update at midnight for every row.
+_OUTDATED_SQL = (
+    "(d.due_date IS NOT NULL "
+    " AND d.due_date < CURRENT_DATE "
+    " AND d.status NOT IN ('done','cancelled'))"
+)
+# Standard projection: every column on ``deliverables`` plus the computed
+# ``is_outdated`` flag. Centralised so list/get/create/patch can't drift.
+_PROJECTION = f"d.*, {_OUTDATED_SQL} AS is_outdated"
 
 
 class DeliverableCreate(StrictModel):
@@ -105,7 +118,7 @@ def _list(event: Mapping[str, Any]) -> dict[str, Any]:
         cur.execute(f"SELECT COUNT(DISTINCT d.id) AS n FROM deliverables d {join} {where_sql}", params)
         total = cur.fetchone()["n"]
         cur.execute(
-            f"SELECT DISTINCT d.* FROM deliverables d {join} {where_sql} "
+            f"SELECT DISTINCT {_PROJECTION} FROM deliverables d {join} {where_sql} "
             f"ORDER BY d.created_at DESC LIMIT %s OFFSET %s",
             (*params, limit, offset),
         )
@@ -116,7 +129,7 @@ def _list(event: Mapping[str, Any]) -> dict[str, Any]:
 def _get(event: Mapping[str, Any], deliverable_id: str) -> dict[str, Any]:
     conn = db.get_conn()
     with conn.cursor() as cur:
-        cur.execute("SELECT * FROM deliverables WHERE id = %s", (deliverable_id,))
+        cur.execute(f"SELECT {_PROJECTION} FROM deliverables d WHERE d.id = %s", (deliverable_id,))
         row = cur.fetchone()
     if not row:
         return http.not_found(event=event)
@@ -168,9 +181,16 @@ def _create(event: Mapping[str, Any]) -> dict[str, Any]:
     with db.transaction() as conn, conn.cursor() as cur:
         cur.execute(
             """
-            INSERT INTO deliverables (project_id, title, status, due_date, depends_on)
-            VALUES (%s, %s, %s, %s, %s)
-            RETURNING *
+            WITH ins AS (
+                INSERT INTO deliverables (project_id, title, status, due_date, depends_on)
+                VALUES (%s, %s, %s, %s, %s)
+                RETURNING *
+            )
+            SELECT ins.*,
+                   (ins.due_date IS NOT NULL
+                    AND ins.due_date < CURRENT_DATE
+                    AND ins.status NOT IN ('done','cancelled')) AS is_outdated
+            FROM ins
             """,
             (body.project_id, body.title, body.status, body.due_date, body.depends_on),
         )
@@ -222,7 +242,16 @@ def _patch(event: Mapping[str, Any], deliverable_id: str) -> dict[str, Any]:
     set_sql = ", ".join(f"{k} = %s" for k in fields)
     with db.transaction() as conn, conn.cursor() as cur:
         cur.execute(
-            f"UPDATE deliverables SET {set_sql} WHERE id = %s RETURNING *",
+            f"""
+            WITH upd AS (
+                UPDATE deliverables SET {set_sql} WHERE id = %s RETURNING *
+            )
+            SELECT upd.*,
+                   (upd.due_date IS NOT NULL
+                    AND upd.due_date < CURRENT_DATE
+                    AND upd.status NOT IN ('done','cancelled')) AS is_outdated
+            FROM upd
+            """,
             (*fields.values(), deliverable_id),
         )
         row = cur.fetchone()

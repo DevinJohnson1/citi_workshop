@@ -9,8 +9,8 @@ interface ReportPanel {
 
 const PANELS: ReportPanel[] = [
   { key: 'at-risk', label: 'At-risk projects', path: '/reports-service/at-risk' },
-  { key: 'over-allocated', label: 'Over-allocated users', path: '/reports-service/over-allocated' },
-  { key: 'over-assigned', label: 'Over-assigned users', path: '/reports-service/over-assigned' },
+  { key: 'over-allocated', label: 'Users with overlapping allocations', path: '/reports-service/over-allocated' },
+  { key: 'over-assigned', label: 'Overworked users (>3 projects or >10 deliverables)', path: '/reports-service/over-assigned' },
   { key: 'budget', label: 'Budget vs planned', path: '/reports-service/budget-vs-planned' },
 ];
 

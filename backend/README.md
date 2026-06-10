@@ -13,7 +13,7 @@ behavior. No web framework on Lambda; dispatch on
 | `assignments-service/`  | Many-to-many deliverable<->user with `role_on_assignment`.              |
 | `resources-service/`    | Read/edit staffing metadata on `users WHERE is_allocatable=true`.       |
 | `allocations-service/`  | Project-level capacity; warns on over-allocation.                       |
-| `budget-service/`       | Immutable `budget_plans` + append-only `budget_entries`.                |
+| `budget-service/`       | Singular per-project budget on `projects.budget_amount`; live consumption rollup from assigned equipment. |
 | `reports-service/`      | Read-only rollups for the 7 workshop questions.                         |
 ## Shared code
 `_lib/` (underscore prefix -> excluded from discovery) is the only code each
@@ -37,7 +37,10 @@ Schema is 3NF -- see SYSTEM_DESIGN section 6 for the canonical ERD. Highlights:
 - single identity table (`users`); `is_allocatable` flags staffable users.
 - `assignments` is the M:N table for both team leads and team members;
   `role_on_assignment` differentiates `owner`/`contributor`/`reviewer`.
-- budget split into immutable `budget_plans` + append-only `budget_entries`.
+- budget is a singular ceiling on `projects.budget_amount` /
+  `budget_currency`; the only thing that draws against it is
+  `equipment.cost` on tangibles/intangibles assigned to the project, and
+  the equipment-service enforces the ceiling on create/patch.
 - `audit_log` is append-only; every mutation writes a row.
 ## Adding a service
 ```bash

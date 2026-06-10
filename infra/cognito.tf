@@ -57,9 +57,9 @@ resource "aws_cognito_user_pool_client" "this" {
     var.cloudfront_domain != "" ? format("https://%s/", var.cloudfront_domain) : "",
   ])
 
-  access_token_validity  = 60   # minutes
-  id_token_validity      = 60   # minutes
-  refresh_token_validity = 30   # days
+  access_token_validity  = 60 # minutes
+  id_token_validity      = 60 # minutes
+  refresh_token_validity = 30 # days
   token_validity_units {
     access_token  = "minutes"
     id_token      = "minutes"
