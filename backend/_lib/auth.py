@@ -141,26 +141,38 @@ def invalidate_user_cache(cognito_sub: str | None = None) -> None:
 
 
 def _ensure_user(cognito_sub: str, email: str, default_role: str = "viewer") -> dict[str, Any]:
-    """Upsert the ``users`` row keyed by ``cognito_sub`` and return it.
+    """Upsert the ``users`` row keyed by ``email`` and return it.
+
+    The conflict target is ``email`` (not ``cognito_sub``) so that personas
+    pre-seeded by migration 004 — which use a ``pending:<email>`` sentinel
+    sub — are atomically upgraded to the real Cognito sub on first login.
+    Email is also UNIQUE in the schema, so this is safe.
 
     For seed accounts (see :data:`_SEED_ROLES`) the role is reapplied on every
     login so an operator who mutates the row manually still ends up with the
     canonical workshop persona on the next request.
+
+    Anyone with role ``team_lead``/``team_member`` is auto-flagged
+    ``is_allocatable=true`` so they immediately show up in the People resource
+    list and the project allocations picker. Admins and viewers stay
+    unflagged per the v1.4 role spec.
     """
     conn = db.get_conn()
     is_seed = email.lower() in _SEED_ROLES
+    staff_role = default_role in {"team_lead", "team_member"}
     with conn.transaction(), conn.cursor() as cur:
         cur.execute(
             """
-            INSERT INTO users (cognito_sub, email, role)
-            VALUES (%s, %s, %s)
-            ON CONFLICT (cognito_sub) DO UPDATE
-                SET email = EXCLUDED.email,
-                    role  = CASE WHEN %s THEN EXCLUDED.role ELSE users.role END
+            INSERT INTO users (cognito_sub, email, role, is_allocatable)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (email) DO UPDATE
+                SET cognito_sub = EXCLUDED.cognito_sub,
+                    role        = CASE WHEN %s THEN EXCLUDED.role ELSE users.role END,
+                    is_allocatable = users.is_allocatable OR EXCLUDED.is_allocatable
             RETURNING id, cognito_sub, email, full_name, job_title,
                       is_allocatable, weekly_capacity_hours, role
             """,
-            (cognito_sub, email, default_role, is_seed),
+            (cognito_sub, email, default_role, staff_role, is_seed),
         )
         row = cur.fetchone()
         return dict(row)

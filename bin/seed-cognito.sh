@@ -41,6 +41,8 @@ command -v terraform >/dev/null 2>&1 || { echo "ERROR: terraform is missing"; ex
 # create users in a real AWS account when the developer has stale creds.
 if [ "$TARGET" = "local" ]; then
     export AWS_ENDPOINT_URL="http://localhost:4566"
+    # AWS_ENDPOINT_URL_S3 is required for Terraform ≥1.13 S3 backend reads.
+    export AWS_ENDPOINT_URL_S3="http://s3.localhost.localstack.cloud:4566"
     export AWS_ACCESS_KEY_ID="test"
     export AWS_SECRET_ACCESS_KEY="test"
     export AWS_REGION="${AWS_REGION:-us-east-1}"

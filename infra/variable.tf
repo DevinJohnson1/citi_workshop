@@ -23,13 +23,13 @@ variable "aws_vpc_id" {
 }
 
 variable "aws_postgres_enabled" {
-  description = "Enable or disable PostgreSQL (AWS Aurora). Default: true (set to 'false' to disable it)."
+  description = "Enable Aurora PostgreSQL. When true (default), Aurora is provisioned in both LocalStack Pro and real AWS. LocalStack Pro (LOCALSTACK_AUTH_TOKEN) is required for local Aurora emulation. Set to false only for LocalStack Community (no RDS support) — the plain postgres:17 Docker container in docker-compose.yml is used as a fallback in that case."
   type        = bool
   default     = true
 }
 
 variable "aws_postgres_host" {
-  description = "PostgreSQL host for LocalStack. Default: 'host.docker.internal' (set to '172.17.0.1' on Linux)."
+  description = "Override the Lambda POSTGRES_HOST env var. Only relevant when aws_postgres_enabled=false (plain Docker postgres fallback). Defaults to 'postgres' (Docker service name). On some Linux configurations with Docker Desktop you may need '172.17.0.1'."
   type        = string
   default     = null
 }

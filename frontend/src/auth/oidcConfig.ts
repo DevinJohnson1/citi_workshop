@@ -22,8 +22,21 @@ export const oidcConfig: AuthProviderProps = {
   },
 };
 
-/** True when Cognito vars are wired (production). False on LocalStack. */
+/**
+ * True only when running against real AWS Cognito (https:// authority).
+ *
+ * We must NOT mount `<AuthProvider>` on LocalStack because `oidc-client-ts`
+ * would attempt to fetch the OIDC discovery document from the authority URL.
+ * For LocalStack, `VITE_COGNITO_AUTHORITY` starts with `http://` (LocalStack
+ * endpoint) so this flag is `false`, preventing the outbound request that
+ * previously caused 1–2 minute login delays.
+ *
+ * The workshop login flow always uses `session.ts` + direct `InitiateAuth`
+ * (cognito.ts) regardless of this flag. OIDC is only needed for the Hosted UI
+ * redirect flow on real AWS.
+ */
 export const isAuthConfigured: boolean =
   Boolean(import.meta.env.VITE_COGNITO_AUTHORITY) &&
-  Boolean(import.meta.env.VITE_COGNITO_CLIENT_ID);
-
+  Boolean(import.meta.env.VITE_COGNITO_CLIENT_ID) &&
+  // Require https:// — LocalStack authority is http://, production is https://
+  (import.meta.env.VITE_COGNITO_AUTHORITY as string).startsWith('https://');

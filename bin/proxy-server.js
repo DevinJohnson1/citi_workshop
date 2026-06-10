@@ -105,6 +105,31 @@ const server = http.createServer((req, res) => {
 
   const endpointName = pathParts[1];
   const remainingPath = pathParts.length > 2 ? '/' + pathParts.slice(2).join('/') : '';
+
+  // Explicit existence check. `endpoints[endpointName]` can be undefined when
+  // `.env.local` is stale (e.g. LocalStack was restarted and the per-service
+  // Function URLs were reissued, but `bin/generate-env.sh` was not re-run).
+  // Without this check we'd silently build `"undefined" + remainingPath`,
+  // pass the `if (!targetUrl)` guard below (truthy string), and then crash
+  // inside `http.request()` with a cryptic "Invalid URL" — which surfaces in
+  // the browser as the dreaded `TypeError: Failed to fetch` because the
+  // proxy closes the socket before writing a response.
+  if (!Object.prototype.hasOwnProperty.call(endpoints, endpointName)) {
+    console.error(
+      `[proxy] Unknown endpoint "${endpointName}". `
+      + `Known: ${Object.keys(endpoints).join(', ') || '(none)'}. `
+      + `Re-run ./bin/generate-env.sh after every LocalStack restart.`,
+    );
+    res.writeHead(502, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      error: 'Bad Gateway',
+      message: `Endpoint "${endpointName}" is not in .env.local. `
+        + 'Re-run ./bin/generate-env.sh and restart the proxy.',
+      available: Object.keys(endpoints),
+    }));
+    return;
+  }
+
   const targetUrl = endpoints[endpointName] + remainingPath + (parsedUrl.search || '');
 
   if (!targetUrl) {
@@ -118,8 +143,20 @@ const server = http.createServer((req, res) => {
 
   console.log(`${req.method} /api/${endpointName} -> ${targetUrl}`);
 
-  // Parse target URL
+  // Parse target URL. `url.parse` is lenient and returns an object even for
+  // garbage input — guard explicitly so we don't ship requests with a null
+  // hostname into `http.request`, which throws synchronously and would
+  // otherwise drop the client socket without a response.
   const target = url.parse(targetUrl);
+  if (!target.hostname) {
+    console.error(`[proxy] Refusing to proxy: target URL has no hostname (${targetUrl})`);
+    res.writeHead(502, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      error: 'Bad Gateway',
+      message: `Endpoint "${endpointName}" resolved to an invalid URL: ${targetUrl}`,
+    }));
+    return;
+  }
   const protocol = target.protocol === 'https:' ? https : http;
 
   // Forward request - strip all CORS-related and browser headers
@@ -165,9 +202,25 @@ const server = http.createServer((req, res) => {
   });
 
   proxyReq.on('error', (err) => {
-    console.error('Proxy error:', err.message);
-    res.writeHead(502, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'Bad Gateway', message: err.message }));
+    console.error(`[proxy] Upstream error for ${endpointName}: ${err.message} (url=${targetUrl})`);
+    // Headers may already be sent if the upstream half-responded then dropped;
+    // writeHead would throw in that case, so guard.
+    if (!res.headersSent) {
+      res.writeHead(502, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        error: 'Bad Gateway',
+        message: `${err.message} (upstream=${targetUrl})`,
+      }));
+    } else {
+      res.end();
+    }
+  });
+  // Cap upstream wait so a hung Lambda surfaces as a 504 with CORS instead
+  // of a half-open socket that the browser eventually reports as "Failed to
+  // fetch". 30s is well above any realistic cold start.
+  proxyReq.setTimeout(30_000, () => {
+    console.error(`[proxy] Upstream timeout for ${endpointName} (url=${targetUrl})`);
+    proxyReq.destroy(new Error('Upstream timed out after 30s'));
   });
 
   req.pipe(proxyReq);

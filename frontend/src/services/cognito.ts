@@ -4,7 +4,7 @@
  * Hosted UI redirect. Works against both real AWS and LocalStack Pro.
  */
 
-import { setSession } from '../auth/session';
+import { setSession, roleForEmail } from '../auth/session';
 
 interface AuthenticationResult {
   AccessToken: string;
@@ -107,12 +107,15 @@ export async function signIn(email: string, password: string): Promise<void> {
   }
 
   const auth = data.AuthenticationResult;
+  const resolvedEmail = decodeEmail(auth.IdToken) || email;
   setSession({
     accessToken: auth.AccessToken,
     idToken: auth.IdToken,
     refreshToken: auth.RefreshToken,
     expiresAt: Math.floor(Date.now() / 1000) + auth.ExpiresIn,
-    email: decodeEmail(auth.IdToken) || email,
+    email: resolvedEmail,
+    // UI-only hint; backend re-derives the authoritative role per request.
+    role: roleForEmail(resolvedEmail),
   });
 }
 

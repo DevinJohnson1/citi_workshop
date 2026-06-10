@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { useApi, type ListResponse } from '../services/apiClient';
+import { useHasRole } from '../auth/useRole';
 import type { Project, ProjectStatus } from '../types/api';
 
 const STATUSES: ProjectStatus[] = ['planned', 'active', 'on_hold', 'done', 'cancelled'];
@@ -8,6 +9,7 @@ const STATUSES: ProjectStatus[] = ['planned', 'active', 'on_hold', 'done', 'canc
 /** Projects list — hand-rolled `<table>` with search, status filter, and at-risk toggle. */
 export function ProjectsListPage() {
   const { apiGet } = useApi();
+  const canCreate = useHasRole('admin', 'team_lead');
   const [rows, setRows] = useState<Project[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -33,12 +35,14 @@ export function ProjectsListPage() {
     <section className="space-y-4">
       <header className="flex items-center justify-between">
         <h1 className="text-xl font-semibold">Projects</h1>
-        <Link
-          to="/projects/new"
-          className="rounded bg-brand-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-brand-700"
-        >
-          New project
-        </Link>
+        {canCreate && (
+          <Link
+            to="/projects/new"
+            className="rounded bg-brand-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-brand-700"
+          >
+            New project
+          </Link>
+        )}
       </header>
 
       <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">

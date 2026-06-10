@@ -98,15 +98,26 @@ locals {
     APP_NAME   = format("%s-%s", var.aws_project, local.app_id)
     APP_ROLE   = format("arn:%s:iam::%s:role/%s-assume-%s-%s", data.aws_partition.this.partition, data.aws_caller_identity.this.account_id, var.aws_project, data.aws_region.this.region, local.app_id)
     APP_REGION = data.aws_region.this.region
-    # Local: resolves to the `postgres` service on the shared "coding-workshop"
-    # docker network (see docker-compose.yml + LAMBDA_DOCKER_NETWORK). AWS: RDS
-    # endpoint. var.aws_postgres_host remains an override hatch for unusual
-    # local topologies.
-    POSTGRES_HOST        = data.aws_caller_identity.this.id == "000000000000" ? coalesce(try(trimspace(var.aws_postgres_host), ""), "postgres") : try(element(aws_rds_cluster.this.*.endpoint, 0), "")
-    POSTGRES_PORT        = data.aws_caller_identity.this.id == "000000000000" ? "5432" : try(element(aws_rds_cluster.this.*.port, 0), "")
-    POSTGRES_NAME        = data.aws_caller_identity.this.id == "000000000000" ? "postgres" : try(element(aws_rds_cluster.this.*.database_name, 0), "")
-    POSTGRES_USER        = data.aws_caller_identity.this.id == "000000000000" ? "postgres" : try(element(aws_rds_cluster.this.*.master_username, 0), "")
-    POSTGRES_PASS        = data.aws_caller_identity.this.id == "000000000000" ? "postgres123" : try(element(aws_rds_cluster.this.*.master_password, 0), "")
+    # ── PostgreSQL connection ───────────────────────────────────────────────────
+    # When aws_postgres_enabled = true (default), every environment uses Aurora:
+    #   • LocalStack Pro: Aurora is provisioned by Terraform in LocalStack. Lambda
+    #     containers reach it via "workshop-localstack" (the Docker container name
+    #     on the "coding-workshop" network) rather than via the cluster DNS — the
+    #     DNS suffix *.rds.localhost.localstack.cloud resolves to 127.0.0.1, which
+    #     is the Lambda container itself, not LocalStack. Same pattern as
+    #     COGNITO_JWKS_URL above.
+    #   • Real AWS: standard Aurora cluster writer endpoint.
+    # When aws_postgres_enabled = false (LocalStack Community / no-RDS mode), the
+    # plain postgres:17 Docker container is used instead.
+    POSTGRES_HOST = var.aws_postgres_enabled ? (
+      data.aws_caller_identity.this.id == "000000000000"
+      ? "workshop-localstack"
+      : try(element(aws_rds_cluster.this.*.endpoint, 0), "")
+    ) : coalesce(try(trimspace(var.aws_postgres_host), ""), "postgres")
+    POSTGRES_PORT = var.aws_postgres_enabled ? tostring(try(element(aws_rds_cluster.this.*.port, 0), 5432)) : "5432"
+    POSTGRES_NAME = var.aws_postgres_enabled ? try(element(aws_rds_cluster.this.*.database_name, 0), replace(var.aws_project, "-", "")) : "postgres"
+    POSTGRES_USER = var.aws_postgres_enabled ? try(element(aws_rds_cluster.this.*.master_username, 0), "superadmin") : "postgres"
+    POSTGRES_PASS = var.aws_postgres_enabled ? try(element(aws_rds_cluster.this.*.master_password, 0), "") : "postgres123"
     COGNITO_USER_POOL_ID = local.cognito_enabled ? try(element(aws_cognito_user_pool.this.*.id, 0), "") : ""
     COGNITO_CLIENT_ID    = local.cognito_enabled ? try(element(aws_cognito_user_pool_client.this.*.id, 0), "") : ""
     # COGNITO_ISSUER_URL must match the `iss` claim that the IdP actually puts

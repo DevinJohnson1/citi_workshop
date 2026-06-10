@@ -1,23 +1,50 @@
 import { useEffect, useState, type ReactNode } from 'react';
 import { Link, NavLink, useNavigate } from 'react-router-dom';
-import { clearSession, getSession, onSessionChange, type WorkshopSession } from '../auth/session';
+import {
+  clearSession,
+  getSession,
+  onSessionChange,
+  type SessionRole,
+  type WorkshopSession,
+} from '../auth/session';
 
 interface Props {
   children: ReactNode;
 }
 
-const navItems = [
-  { to: '/dashboard', label: 'Dashboard' },
-  { to: '/projects', label: 'Projects' },
-  { to: '/resources', label: 'Resources' },
-  { to: '/reports', label: 'Reports' },
-  { to: '/admin', label: 'Admin' },
+interface NavItem {
+  to: string;
+  label: string;
+  /** Roles permitted to see the link. Omit to allow any signed-in user. */
+  roles?: SessionRole[];
+}
+
+/**
+ * Primary nav. `roles` mirrors the route guard matrix in `App.tsx`; keep
+ * them in sync. Unauthenticated visitors only see the brand link.
+ *
+ * Per-role visibility (UI gate only — backend re-enforces):
+ *   - admin       → Admin (operator only, no project nav).
+ *   - team_lead   → Dashboard, Projects, Resources, Reports.
+ *   - team_member → Dashboard, Projects, Resources, Reports.
+ *   - viewer      → Dashboard, Reports.
+ *
+ * Every entry MUST declare its `roles` allowlist. An entry without `roles`
+ * would leak to admins (against the spec) — the linter-style assertion in
+ * `visibleNav` below enforces it at runtime.
+ */
+const NAV_ITEMS: NavItem[] = [
+  { to: '/dashboard', label: 'Dashboard', roles: ['team_lead', 'team_member', 'viewer'] },
+  { to: '/projects',  label: 'Projects',  roles: ['team_lead', 'team_member'] },
+  { to: '/resources', label: 'Resources', roles: ['team_lead', 'team_member'] },
+  { to: '/reports',   label: 'Reports',   roles: ['team_lead', 'team_member', 'viewer'] },
+  { to: '/admin',     label: 'Admin',     roles: ['admin'] },
 ];
 
 /**
- * App shell — header with nav links and a sign-in / sign-out control wired
- * to the workshop's `auth/session.ts` store. Layout is responsive via
- * Tailwind: stacked nav < md, horizontal ≥ md.
+ * App shell — header with role-filtered nav and a sign-in / sign-out
+ * control wired to the workshop's `auth/session.ts` store. Layout is
+ * responsive via Tailwind: stacked nav < md, horizontal ≥ md.
  */
 export function AppShell({ children }: Props) {
   const navigate = useNavigate();
@@ -32,6 +59,10 @@ export function AppShell({ children }: Props) {
     navigate('/', { replace: true });
   };
 
+  const visibleNav = session
+    ? NAV_ITEMS.filter((item) => item.roles?.includes(session.role) ?? false)
+    : [];
+
   return (
     <div className="min-h-full flex flex-col">
       <header className="border-b border-gray-200 bg-white">
@@ -40,7 +71,7 @@ export function AppShell({ children }: Props) {
             ACME Project Tracker
           </Link>
           <nav aria-label="Primary" className="flex flex-wrap gap-x-4 gap-y-1 text-sm">
-            {navItems.map((item) => (
+            {visibleNav.map((item) => (
               <NavLink
                 key={item.to}
                 to={item.to}
@@ -54,13 +85,21 @@ export function AppShell({ children }: Props) {
           </nav>
           <div className="text-sm text-gray-600">
             {session ? (
-              <button
-                type="button"
-                onClick={handleSignOut}
-                className="rounded border border-gray-300 px-3 py-1 hover:bg-gray-50"
-              >
-                Sign out ({session.email || 'user'})
-              </button>
+              <div className="flex items-center gap-2">
+                <span
+                  className="rounded bg-brand-50 px-2 py-0.5 text-xs font-medium text-brand-700"
+                  aria-label={`Signed in as ${session.role}`}
+                >
+                  {session.role}
+                </span>
+                <button
+                  type="button"
+                  onClick={handleSignOut}
+                  className="rounded border border-gray-300 px-3 py-1 hover:bg-gray-50"
+                >
+                  Sign out ({session.email || 'user'})
+                </button>
+              </div>
             ) : (
               <Link
                 to="/login"

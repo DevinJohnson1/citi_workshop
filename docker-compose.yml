@@ -1,16 +1,31 @@
 # =============================================================================
-# Local development stack — Postgres + LocalStack, both in Docker.
+# Local development stack.
+#
+# By default (aws_postgres_enabled=true) the project uses Aurora PostgreSQL
+# emulated by LocalStack Pro. The plain `postgres` service below is a fallback
+# for users running LocalStack Community (which has no RDS support) who set
+# aws_postgres_enabled=false in their Terraform config.
+#
+# Aurora path (default):
+#   - Requires: LOCALSTACK_IMAGE=localstack/localstack-pro and LOCALSTACK_AUTH_TOKEN
+#   - Terraform provisions the Aurora cluster inside LocalStack at apply time.
+#   - Lambda containers connect to Aurora via workshop-localstack:<rds_port>.
+#   - bin/migrate.sh reads the Aurora endpoint from terraform outputs.
+#   - The `postgres` service is NOT started; ignore or comment out its entry.
+#
+# Fallback path (aws_postgres_enabled=false):
+#   - Start both services: docker compose up -d postgres localstack
+#   - Lambda containers connect to the `postgres` service on this network.
+#   - bin/migrate.sh uses docker compose exec postgres psql.
 #
 # Both services attach to the user-defined "coding-workshop" network so that
 # Lambda containers spawned by LocalStack (via LAMBDA_DOCKER_NETWORK) can
-# resolve the database by its service name: postgres:5432.
+# resolve hostnames by service name.
 #
 # Ports are also published to the host so host-side tooling works:
-#   - psql / migrate.sh             → localhost:5432
+#   - psql / migrate.sh             → localhost:5432  (fallback postgres)
 #   - AWS CLI / terraform / proxy   → localhost:4566
-#
-# This file is the single source of truth for local infra. setup-environment.sh
-# pre-pulls the images; start-dev.sh runs `docker compose up -d` against it.
+#   - LocalStack RDS (Aurora)       → localhost:4510-4559 (dynamic port)
 # =============================================================================
 
 name: coding-workshop
@@ -25,7 +40,21 @@ volumes:
   localstack_data:
 
 services:
+  # ── Fallback plain Postgres ────────────────────────────────────────────────
+  # Only active when the "postgres" Compose profile is enabled, which happens
+  # automatically in two cases:
+  #   1. start-dev.sh detects LocalStack Community (LOCALSTACK_IMAGE has no
+  #      "pro") and sets TF_VAR_aws_postgres_enabled=false.
+  #   2. The user manually sets TF_VAR_aws_postgres_enabled=false.
+  #
+  # To activate the profile when running docker compose directly:
+  #   COMPOSE_PROFILES=postgres docker compose up -d
+  # Or add COMPOSE_PROFILES=postgres to your .env file.
+  #
+  # When aws_postgres_enabled=true (LocalStack Pro default), this container is
+  # NOT started — Aurora is hosted by LocalStack Pro instead.
   postgres:
+    profiles: ["postgres"]
     image: postgres:17
     container_name: workshop-postgres
     restart: unless-stopped
@@ -47,33 +76,62 @@ services:
       start_period: 5s
 
   localstack:
-    # Community edition by default — matches SYSTEM_DESIGN §4.1.
-    # Override via LOCALSTACK_IMAGE in .env (e.g. localstack/localstack-pro).
+    # Community edition by default. To use LocalStack Pro (required for Aurora
+    # RDS emulation when aws_postgres_enabled=true), set in your .env file:
+    #   LOCALSTACK_IMAGE=localstack/localstack-pro:latest
+    #   LOCALSTACK_AUTH_TOKEN=<your-token>
     image: ${LOCALSTACK_IMAGE:-localstack/localstack:latest}
     container_name: workshop-localstack
     restart: unless-stopped
     ports:
       - "4566:4566"           # Edge / Gateway
-      - "4510-4559:4510-4559" # External service ports (e.g. Lambda Function URLs)
+      - "4510-4559:4510-4559" # External service ports (e.g. Lambda Function URLs, RDS Aurora)
+    # Raise the open-file limit for the LocalStack process. LocalStack manages
+    # Docker-in-Docker Lambda containers; each child container + its network
+    # socket consumes several file descriptors in the parent process. The
+    # default Docker container ulimit (1024) is too low when more than a handful
+    # of Lambda environments are alive at the same time.
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     environment:
       DEBUG: "0"
       PERSISTENCE: "0"
       # Attach Lambda containers to the same network so they can dial
-      # postgres:5432 by service name instead of host-gateway IP gymnastics.
+      # workshop-localstack:<rds_port> for Aurora and workshop-localstack:4566
+      # for Cognito JWKS — both require the container hostname, not localhost.
       LAMBDA_DOCKER_NETWORK: coding-workshop
+      # Remove Lambda execution containers as soon as their keepalive expires.
       LAMBDA_REMOVE_CONTAINERS: "true"
+      # Set keepalive to 30 seconds. With LAMBDA_KEEPALIVE_MS=0 (previous value)
+      # every invocation was a cold start (~1 s each), making the post-login
+      # dashboard load (6 simultaneous Lambda calls) take many seconds. With
+      # 30 s keepalive a warm container answers in ~100 ms instead of ~1 s,
+      # while LAMBDA_LIMITS_CONCURRENCY=4 prevents the container accumulation
+      # that originally caused OSError(24, 'Too many open files') — at most 4
+      # containers run in parallel; they expire 30 s after their last call.
+      LAMBDA_KEEPALIVE_MS: "30000"
+      # Hard cap on concurrent Lambda executions across all functions. Requests
+      # beyond this limit are queued by LocalStack instead of spawning yet another
+      # container. 4 is generous for a single-developer workshop setup.
+      LAMBDA_LIMITS_CONCURRENCY: "4"
       DOCKER_HOST: unix:///var/run/docker.sock
       # LocalStack Pro auth token — required when using localstack/localstack-pro.
-      # Set LOCALSTACK_AUTH_TOKEN in your .env; safely empty for community edition.
+      # Set LOCALSTACK_AUTH_TOKEN in your .env file.
       LOCALSTACK_AUTH_TOKEN: ${LOCALSTACK_AUTH_TOKEN:-}
     volumes:
       - "/var/run/docker.sock:/var/run/docker.sock"
       - "localstack_data:/var/lib/localstack"
     networks:
       - workshop
-    depends_on:
-      postgres:
-        condition: service_healthy
+    # NOTE: The postgres depends_on is intentionally removed. When
+    # aws_postgres_enabled=true, Aurora is hosted inside LocalStack itself and
+    # the plain `postgres` container is not started. If you need the fallback
+    # path (aws_postgres_enabled=false), restore this block:
+    #   depends_on:
+    #     postgres:
+    #       condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:4566/_localstack/health >/dev/null || exit 1"]
       interval: 5s

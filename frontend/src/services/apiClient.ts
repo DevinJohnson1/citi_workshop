@@ -1,3 +1,4 @@
+import { useMemo } from 'react';
 import { useAuth } from 'react-oidc-context';
 import { getAccessToken } from '../auth/session';
 import { isAuthConfigured } from '../auth/oidcConfig';
@@ -30,57 +31,112 @@ export interface ListResponse<T> {
   meta: { total: number; limit: number; offset: number };
 }
 
+/** Shape of the value returned by {@link useApi}. */
+export interface ApiClient {
+  apiGet:    <T>(path: string) => Promise<T>;
+  apiPost:   <T>(path: string, body: unknown) => Promise<T>;
+  apiPatch:  <T>(path: string, body: unknown) => Promise<T>;
+  apiDelete: <T = void>(path: string) => Promise<T>;
+}
+
 /**
  * React hook returning a thin, typed `fetch` wrapper that injects the
  * Cognito access token. The workshop login flow stashes the token via
- * `auth/session.ts`; we also fall back to `react-oidc-context` for callers
- * that integrate Cognito's Hosted UI in production.
+ * `auth/session.ts` (direct InitiateAuth); the OIDC user from
+ * `react-oidc-context` is used as a fallback only on real AWS where the
+ * Hosted UI is active (`isAuthConfigured = true`).
+ *
+ * On LocalStack `isAuthConfigured = false` and `<AuthProvider>` is not
+ * mounted, so `useAuth()` returns an empty/null context (or throws).
+ * The try-catch guards that case; `getAccessToken()` always takes priority
+ * so the OIDC fallback is only reached in production.
+ *
+ * ## Identity stability (read before "optimising" this)
+ *
+ * The returned object is memoised on `token`, so `apiGet`/`apiPost`/etc.
+ * keep referential identity across renders as long as the auth token
+ * doesn't change. This matters because every consumer uses these
+ * functions as `useEffect` / `useCallback` dependencies — without
+ * memoisation, each parent re-render handed back fresh closures, which
+ * re-fired every fetch on every render and produced visible
+ * loading-spinner flicker (setLoading(true)→fetch→setLoading(false)
+ * → render → new closure → fetch again, ad infinitum).
+ *
+ * If you ever add a new field to the returned object, include any value
+ * it closes over in the `useMemo` dependency list — otherwise you'll
+ * reintroduce stale-closure bugs (the new field would capture the first
+ * render's value forever).
  */
-export function useApi() {
-  const auth = useAuth();
-  // Prefer the workshop session (set by LoginPage); fall back to the OIDC
-  // user when Hosted UI is wired up.
-  const token = getAccessToken() ?? (isAuthConfigured ? auth.user?.access_token : undefined);
+export function useApi(): ApiClient {
+  // useAuth() is always called to satisfy React's rules of hooks.
+  // It is safe because ConditionalAuthProvider always mounts AuthProvider
+  // when isAuthConfigured=true. When false (LocalStack), useAuth() may
+  // return undefined or throw; we catch that and fall back to session.ts.
+  let oidcAccessToken: string | undefined;
+  try {
+    const auth = useAuth();
+    oidcAccessToken = isAuthConfigured ? (auth.user?.access_token ?? undefined) : undefined;
+  } catch {
+    // No AuthProvider context (LocalStack) — OIDC token not available.
+    oidcAccessToken = undefined;
+  }
 
-  /** Build standard headers; merges caller overrides last. */
-  const headers = (extra: HeadersInit = {}): HeadersInit => {
-    const h: Record<string, string> = { Accept: 'application/json', ...(extra as Record<string, string>) };
-    if (token) h.Authorization = `Bearer ${token}`;
-    return h;
-  };
+  const token = getAccessToken() ?? oidcAccessToken;
 
-  /** Parse the response body, throwing `ApiError` on non-2xx. */
-  const handle = async <T,>(res: Response): Promise<T> => {
-    if (res.status === 204) return undefined as T;
-    const isJson = (res.headers.get('content-type') ?? '').includes('json');
-    const body = isJson ? await res.json() : null;
-    if (!res.ok) {
-      throw new ApiError(res.status, isJson ? (body as ApiErrorBody) : null);
-    }
-    return body as T;
-  };
+  return useMemo<ApiClient>(() => {
+    /** Build standard headers; merges caller overrides last. */
+    const headers = (extra: HeadersInit = {}): HeadersInit => {
+      const h: Record<string, string> = { Accept: 'application/json', ...(extra as Record<string, string>) };
+      if (token) h.Authorization = `Bearer ${token}`;
+      return h;
+    };
 
-  return {
-    /** GET `/<path>`. Path is appended verbatim to `VITE_API_BASE_URL`. */
-    apiGet: <T>(path: string) =>
-      fetch(`${BASE_URL}${path}`, { method: 'GET', headers: headers() }).then(handle<T>),
-    /** POST `/<path>` with a JSON body. */
-    apiPost: <T>(path: string, body: unknown) =>
-      fetch(`${BASE_URL}${path}`, {
-        method: 'POST',
-        headers: headers({ 'Content-Type': 'application/json' }),
-        body: JSON.stringify(body),
-      }).then(handle<T>),
-    /** PATCH `/<path>` with a JSON body. */
-    apiPatch: <T>(path: string, body: unknown) =>
-      fetch(`${BASE_URL}${path}`, {
-        method: 'PATCH',
-        headers: headers({ 'Content-Type': 'application/json' }),
-        body: JSON.stringify(body),
-      }).then(handle<T>),
-    /** DELETE `/<path>`. */
-    apiDelete: <T = void>(path: string) =>
-      fetch(`${BASE_URL}${path}`, { method: 'DELETE', headers: headers() }).then(handle<T>),
-  };
+    /** Parse the response body, throwing `ApiError` on non-2xx. */
+    const handle = async <T,>(res: Response): Promise<T> => {
+      if (res.status === 204) return undefined as T;
+      const isJson = (res.headers.get('content-type') ?? '').includes('json');
+      const body = isJson ? await res.json() : null;
+      if (!res.ok) {
+        throw new ApiError(res.status, isJson ? (body as ApiErrorBody) : null);
+      }
+      return body as T;
+    };
+
+    /**
+     * Run `fetch` and convert transport-layer `TypeError`s (the browser's
+     * generic "Failed to fetch" — DNS failure, refused connection, CORS
+     * preflight rejection, mid-flight socket close) into a message that
+     * names the URL we tried.
+     */
+    const doFetch = async <T,>(url: string, init: RequestInit): Promise<T> => {
+      let res: Response;
+      try {
+        res = await fetch(url, init);
+      } catch (err) {
+        const cause = err instanceof Error ? err.message : String(err);
+        throw new Error(`Network error calling ${init.method ?? 'GET'} ${url}: ${cause}`);
+      }
+      return handle<T>(res);
+    };
+
+    return {
+      apiGet: <T>(path: string) =>
+        doFetch<T>(`${BASE_URL}${path}`, { method: 'GET', headers: headers() }),
+      apiPost: <T>(path: string, body: unknown) =>
+        doFetch<T>(`${BASE_URL}${path}`, {
+          method: 'POST',
+          headers: headers({ 'Content-Type': 'application/json' }),
+          body: JSON.stringify(body),
+        }),
+      apiPatch: <T>(path: string, body: unknown) =>
+        doFetch<T>(`${BASE_URL}${path}`, {
+          method: 'PATCH',
+          headers: headers({ 'Content-Type': 'application/json' }),
+          body: JSON.stringify(body),
+        }),
+      apiDelete: <T = void>(path: string) =>
+        doFetch<T>(`${BASE_URL}${path}`, { method: 'DELETE', headers: headers() }),
+    };
+  }, [token]);
 }
 

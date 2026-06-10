@@ -71,12 +71,13 @@ graph TD
     CF -->|/api/deliverables-service*| LD[Lambda deliverables-service]
     CF -->|/api/assignments-service*| LAs[Lambda assignments-service]
     CF -->|/api/resources-service*| LR[Lambda resources-service]
+    CF -->|/api/equipment-service*| LE[Lambda equipment-service]
     CF -->|/api/allocations-service*| LA[Lambda allocations-service]
     CF -->|/api/budget-service*| LB[Lambda budget-service]
     CF -->|/api/reports-service*| LRep[Lambda reports-service]
-    LP & LD & LAs & LR & LA & LB & LRep --> DB[(Aurora PG Serverless v2)]
+    LP & LD & LAs & LR & LE & LA & LB & LRep --> DB[(Aurora PG Serverless v2)]
     Cognito[(Cognito + Hosted UI)] -.->|JWT| Browser
-    LP & LD & LAs & LR & LA & LB & LRep -.->|JWKS cached| Cognito
+    LP & LD & LAs & LR & LE & LA & LB & LRep -.->|JWKS cached| Cognito
 ```
 ## 5. Modules
 `backend/_lib/` (shared; `_` prefix excludes from discovery):
@@ -90,7 +91,8 @@ graph TD
 | `deliverables-service` | CRUD on `deliverables` (incl. `?project_id=`); `depends_on` self-FK; **no longer carries an `assignee_id`** — assignments are a separate resource | read: any · write: admin, owning team_lead; `status` updatable by any user with an open `assignments` row on the deliverable |
 | `assignments-service` | **NEW.** CRUD on `assignments` (many-to-many deliverable↔user); same table for team leads and team members — `role_on_assignment` differentiates `owner` / `contributor` / `reviewer` | read: any · create/delete: admin, owning team_lead · `accepted_at` / `completed_at` writable by the assignee themselves |
 | `resources-service` | Manages staffing metadata on `users WHERE is_allocatable = true` (no separate table); reads project staffing | read: any · write: admin (sets `is_allocatable`, `job_title`, `weekly_capacity_hours`) |
-| `allocations-service` | CRUD on `allocations` (project-level capacity, distinct from deliverable-level assignments); warns on over-allocation, never blocks | read: any · write: admin, owning team_lead |
+| `equipment-service` | **NEW.** CRUD on `equipment` (free-form `kind` — any tangible asset). Tangible-asset resource type alongside people + deliverables. Approval workflow on team_member writes | read: any · create: any signed-in role (team_member forced `approval_status='pending'`) · update incl. approval: admin, team_lead · delete: admin (team_member may withdraw own pending) |
+| `allocations-service` | CRUD on `allocations` (project-level capacity, distinct from deliverable-level assignments); warns on over-allocation, never blocks. Approval workflow on team_member self-requests | read: any · admin/lead write: auto-approved · team_member self-request: `user_id` forced to self, `approval_status='pending'`, lead/admin PATCH to approve/reject |
 | `budget-service` | CRUD on `budget_plans` + append-only `budget_entries`; `GET` returns plan with computed `amount_consumed = SUM(entries.amount)` | read: any · create/delete plan: admin, owning team_lead · record entry: admin, owning team_lead |
 | `reports-service` | GET `/at-risk`, `/over-allocated`, `/over-assigned`, `/allocation-by-user`, `/deliverable-completion`, `/budget-vs-planned`, `/deliverable-chain?project_id=` (project-status rollup uses `projects-service?status=…` instead — no dedicated report endpoint) | read: any |
 ### Request flow
@@ -378,7 +380,7 @@ Login / signup / password / refresh = Cognito Hosted UI. First authenticated cal
 | PATCH | `/api/projects-service/{id}` | admin, owning team_lead |
 | DELETE | `/api/projects-service/{id}` | admin |
 | GET | `/api/deliverables-service` (`?project_id=&status=&assigned_to=<user_id>`) | any | service joins `assignments` to resolve `assigned_to`; the `deliverables` table itself has no `assignee_id` column |
-| POST | `/api/deliverables-service` | admin, owning team_lead |
+| POST | `/api/deliverables-service` | admin, owning team_lead, or team_member with an `allocations` row on the project (forced to `status='todo'` pending lead approval) |
 | GET | `/api/deliverables-service/{id}` | any |
 | PATCH | `/api/deliverables-service/{id}` | admin, owning team_lead, or any user with an open `assignments` row on the deliverable (status only) |
 | DELETE | `/api/deliverables-service/{id}` | admin, owning team_lead |
@@ -387,8 +389,13 @@ Login / signup / password / refresh = Cognito Hosted UI. First authenticated cal
 | GET | `/api/assignments-service/{id}` | any |
 | PATCH | `/api/assignments-service/{id}` | admin, owning team_lead (reassign); assignee themselves (only `accepted_at`, `completed_at`) |
 | DELETE | `/api/assignments-service/{id}` | admin, owning team_lead |
-| CRUD | `/api/resources-service[/...]` | read: any · write: admin (operates on `users WHERE is_allocatable=true`) |
-| CRUD | `/api/allocations-service[/...]` | read: any · write: admin, owning team_lead |
+| CRUD | `/api/resources-service[/...]` | read: any · `GET /me` returns the caller's own row · write: admin (operates on `users WHERE is_allocatable=true`) |
+| CRUD | `/api/allocations-service[/...]` | read: any · admin/lead create + PATCH approval · team_member POST is self-only with `approval_status='pending'`; may withdraw own pending |
+| GET  | `/api/equipment-service` (`?kind=&status=&approval_status=&assigned_project_id=&assigned_user_id=`) | any |
+| GET  | `/api/equipment-service/kinds` | any · distinct `kind` values for UI autocomplete |
+| POST | `/api/equipment-service` | admin, team_lead, team_member (team_member → `approval_status='pending'`) |
+| PATCH | `/api/equipment-service/{id}` | admin, team_lead (also approve/reject via `approval_status`) |
+| DELETE | `/api/equipment-service/{id}` | admin (team_member may withdraw own pending request) |
 | GET | `/api/budget-service?project_id=` | any · returns plans with computed `amount_consumed` |
 | POST | `/api/budget-service` | admin, owning team_lead · creates a `budget_plans` row |
 | DELETE | `/api/budget-service/{plan_id}` | admin · cascades entries |
@@ -423,7 +430,7 @@ Never leak stack traces, file paths, SQL, or driver messages to the client; full
 | `/dashboard` | `DashboardPage` | authed |
 | `/projects` | `ProjectsListPage` | authed; hand-rolled `<table>` + search/filter (consider headless table lib if it grows) |
 | `/projects/:id` | `ProjectDetailPage` | authed; hand-rolled tab nav (Overview, Deliverables, Allocations, Budget) — see §8 a11y rules |
-| `/resources` | `ResourcesPage` | authed; write = admin |
+| `/resources` | `ResourcesPage` | authed (all roles); tabbed by resource type — **People**, **Deliverables**, **Equipment**. Writes per-tab: People=admin, Equipment=admin/team_lead. Budget lives under each project (project-scoped). |
 | `/reports` | `ReportsPage` | authed |
 | `/admin` | `AdminPage` | `role === 'admin'` |
 | `*` | `NotFoundPage` | public; relies on CloudFront 404→`/index.html` |

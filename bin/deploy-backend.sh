@@ -78,23 +78,27 @@ else
     export AWS_SECRET_ACCESS_KEY=test
     export AWS_REGION=us-east-1
     unset AWS_SESSION_TOKEN
-
     # Ensure PARTICIPANT_ID is exported so the shared `terraform init` branch
     # below passes a matching `-backend-config bucket=...` override instead of
     # falling back to the placeholder in infra/provider.tf.
     export PARTICIPANT_ID="${PARTICIPANT_ID:-abcd1234}"
 
-    # Auto-enable Cognito resources when the operator is running LocalStack Pro
-    # (community edition returns 501 Not Implemented for cognito-idp). Detection
-    # is best-effort: if LOCALSTACK_IMAGE contains "pro", flip the TF var.
-    # Sourced from .env via docker compose; we re-read it here for parity.
+    # Source .env so LOCALSTACK_IMAGE / LOCALSTACK_AUTH_TOKEN are visible.
     if [ -f "$PROJECT_ROOT/.env" ]; then
         # shellcheck disable=SC1090
         set -a; . "$PROJECT_ROOT/.env"; set +a
     fi
+
+    # Auto-detect Community vs Pro based on LOCALSTACK_IMAGE.
+    # Pro supports Aurora RDS and Cognito; Community does not.
     if [[ "${LOCALSTACK_IMAGE:-}" == *pro* ]]; then
-        export TF_VAR_enable_cognito=true
-        echo "INFO: LocalStack Pro detected — enabling Cognito (TF_VAR_enable_cognito=true)"
+        export TF_VAR_enable_cognito="${TF_VAR_enable_cognito:-true}"
+        export TF_VAR_aws_postgres_enabled="${TF_VAR_aws_postgres_enabled:-true}"
+        echo "INFO: LocalStack Pro detected — Aurora + Cognito enabled"
+    else
+        export TF_VAR_enable_cognito="${TF_VAR_enable_cognito:-false}"
+        export TF_VAR_aws_postgres_enabled="${TF_VAR_aws_postgres_enabled:-false}"
+        echo "INFO: LocalStack Community detected — Aurora + Cognito disabled; using plain postgres"
     fi
 
     BUCKET_NAME="coding-workshop-tfstate-${PARTICIPANT_ID}"
@@ -129,12 +133,14 @@ fi
 terraform apply -auto-approve
 echo "INFO: Infrastructure deployment complete!"
 
-# Display API endpoint
-if [ -n "$API_BASE_URL" ]; then
+# Post-deployment steps for local environments only.
+# These are safe to call after every apply; both scripts are idempotent.
+if [ "$ENVIRONMENT" != "aws" ]; then
     echo ""
-    echo "API Base URL: $API_BASE_URL"
-fi
-if [ -n "$API_ENDPOINTS" ]; then
+    echo "INFO: Seeding Cognito users..."
+    "$SCRIPT_DIR/seed-cognito.sh" local || echo "  ⚠ Cognito seed skipped (Cognito not enabled or not running)"
+
     echo ""
-    echo "API Endpoints: $API_ENDPOINTS"
+    echo "INFO: Regenerating frontend .env.local..."
+    "$SCRIPT_DIR/generate-env.sh" || echo "  ⚠ Could not regenerate .env.local"
 fi

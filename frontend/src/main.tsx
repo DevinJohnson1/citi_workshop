@@ -1,28 +1,23 @@
 import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
-import { AuthProvider } from 'react-oidc-context';
 import './index.css';
 import { App } from './App';
-import { isAuthConfigured, oidcConfig } from './auth/oidcConfig';
+import { ConditionalAuthProvider } from './auth/ConditionalAuthProvider';
 
 const rootEl = document.getElementById('root');
 if (!rootEl) {
   throw new Error('Missing #root element in index.html');
 }
 
-// When the Cognito env vars are missing we render without AuthProvider so
-// silent renew doesn't spam errors. Note: the backend always enforces JWT
-// verification (no dev-user fallback), so API calls will return 401 until
-// auth is fully configured.
+// ConditionalAuthProvider mounts <AuthProvider> on real AWS (https:// authority)
+// and a passthrough fragment on LocalStack (http:// authority). This ensures:
+//   - production: full OIDC Hosted UI flow works
+//   - LocalStack:  no OIDC discovery request to real AWS (was causing 1-2 min delays)
 createRoot(rootEl).render(
   <StrictMode>
-    {isAuthConfigured ? (
-      <AuthProvider {...oidcConfig}>
-        <App />
-      </AuthProvider>
-    ) : (
+    <ConditionalAuthProvider>
       <App />
-    )}
+    </ConditionalAuthProvider>
   </StrictMode>,
 );
 

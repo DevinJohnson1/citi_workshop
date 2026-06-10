@@ -10,6 +10,13 @@
 
 const STORAGE_KEY = 'workshop.session';
 
+/**
+ * Coarse role taxonomy mirrored from `backend/_lib/auth.py:_SEED_ROLES` and
+ * `frontend/src/types/api.ts:Role`. Duplicated here to avoid a circular import
+ * (types/api.ts already imports nothing from auth/).
+ */
+export type SessionRole = 'admin' | 'team_lead' | 'team_member' | 'viewer';
+
 /** Persisted session payload returned by Cognito InitiateAuth. */
 export interface WorkshopSession {
   accessToken: string;
@@ -19,6 +26,13 @@ export interface WorkshopSession {
   expiresAt: number;
   /** Email claim copied out of the ID token for convenience in the UI. */
   email: string;
+  /**
+   * Best-effort role used **only** to drive UI affordances (hide nav, disable
+   * buttons). All authorization is re-checked server-side in
+   * `backend/_lib/auth.py`. Defaults to `'viewer'` for unknown users so the
+   * UI fails closed.
+   */
+  role: SessionRole;
 }
 
 type Listener = (s: WorkshopSession | null) => void;
@@ -66,5 +80,53 @@ export function clearSession(): void {
 /** Convenience: just the access token, or `null` when signed out. */
 export function getAccessToken(): string | null {
   return getSession()?.accessToken ?? null;
+}
+
+/** Convenience: the caller's role, or `null` when signed out. */
+export function getRole(): SessionRole | null {
+  return getSession()?.role ?? null;
+}
+
+/**
+ * Map the four canonical workshop personas to their seeded roles. Mirrors
+ * `backend/_lib/auth.py:_SEED_ROLES` exactly. Anything else collapses to
+ * `'viewer'` so unknown logins get the least-privileged UI.
+ */
+export function roleForEmail(email: string): SessionRole {
+  switch (email.trim().toLowerCase()) {
+    case 'admin@workshop.local':
+      return 'admin';
+    case 'lead@workshop.local':
+      return 'team_lead';
+    case 'member@workshop.local':
+      return 'team_member';
+    default:
+      return 'viewer';
+  }
+}
+
+/**
+ * Per-role landing page. Used after login (default `returnTo`), by the
+ * landing-page CTA, and by `ProtectedRoute` when redirecting a user away
+ * from a page they don't have access to. Mirrors the route guard matrix in
+ * `App.tsx`.
+ *
+ *   - admin       → `/admin` (the only page they ever interact with)
+ *   - team_lead   → `/dashboard`
+ *   - team_member → `/dashboard`
+ *   - viewer      → `/reports` (their only allowed page)
+ */
+export function homeForRole(role: SessionRole | null | undefined): string {
+  switch (role) {
+    case 'admin':
+      return '/admin';
+    case 'viewer':
+      return '/reports';
+    case 'team_lead':
+    case 'team_member':
+      return '/dashboard';
+    default:
+      return '/login';
+  }
 }
 

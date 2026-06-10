@@ -14,10 +14,15 @@ Starts the local dev stack and the React dev server.
 
 Steps:
   1. docker compose up -d postgres localstack   (waits for health)
-  2. bin/migrate.sh local                       (applies SQL migrations)
-  3. bin/deploy-backend.sh local                (terraform apply against LocalStack)
+  2. bin/deploy-backend.sh local                (terraform apply against LocalStack)
+  3. bin/migrate.sh local                       (applies SQL migrations)
   4. bin/generate-env.sh + CORS proxy on :3001
   5. npm run dev                                (Vite on :3000)
+
+Note: migrations run AFTER the backend deploy because in LocalStack Pro mode
+the Aurora cluster is provisioned by Terraform — migrate.sh needs the
+rds_endpoint_external output to exist. In Community mode the plain postgres
+container is already up from step 1, so the order is harmless either way.
 
 Requirements: docker (with compose plugin), terraform, node, npm.
             (psql is NOT required on the host — migrate.sh runs it inside the container.)
@@ -37,6 +42,8 @@ FRONTEND_DIR="$PROJECT_ROOT/frontend"
 
 # LocalStack endpoints — every aws/terraform invocation in this script targets
 # the dockerized LocalStack on :4566.
+# AWS_ENDPOINT_URL_S3 is required for Terraform ≥1.13: the S3 backend uses
+# this variable (not the generic AWS_ENDPOINT_URL) for state GetObject/PutObject.
 export AWS_ENDPOINT_URL="http://localhost:4566"
 export AWS_ENDPOINT_URL_S3="http://s3.localhost.localstack.cloud:4566"
 export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-test}"
@@ -45,9 +52,9 @@ export AWS_REGION="${AWS_REGION:-us-east-1}"
 unset AWS_SESSION_TOKEN
 
 # ============================================================
-# STEP 1: Start Postgres + LocalStack via Docker Compose
+# STEP 1: Start LocalStack (and optionally the fallback postgres container)
 # ============================================================
-echo "[1/5] Starting Docker containers (postgres + localstack)..."
+echo "[1/5] Starting Docker containers..."
 
 command -v docker >/dev/null 2>&1 || { echo "ERROR: docker is not installed (run bin/setup-environment.sh)"; exit 1; }
 docker info >/dev/null 2>&1 || { echo "ERROR: docker daemon is not running"; exit 1; }
@@ -66,20 +73,64 @@ if [ ! -f .env ] && [ -f .env.example ]; then
     echo "  ℹ Created .env from .env.example (edit it to override workshop defaults)"
 fi
 
+# Source .env so LOCALSTACK_IMAGE is readable in this shell process.
+if [ -f .env ]; then
+    set -a; . .env; set +a
+fi
+
+# ── Community vs Pro detection ──────────────────────────────────────────────
+# LocalStack Pro supports Aurora RDS and Cognito. Community does not.
+# Detect based on LOCALSTACK_IMAGE and propagate to Terraform vars so
+# deploy-backend.sh (called in step 3) uses the right feature flags.
+#
+#   Pro  image → aws_postgres_enabled=true  (Aurora via LocalStack)
+#   Community  → aws_postgres_enabled=false (plain postgres container)
+#
+# An explicit TF_VAR_aws_postgres_enabled in the environment takes priority.
+LOCALSTACK_IMG="${LOCALSTACK_IMAGE:-localstack/localstack:latest}"
+if [[ "$LOCALSTACK_IMG" == *pro* ]]; then
+    export TF_VAR_aws_postgres_enabled="${TF_VAR_aws_postgres_enabled:-true}"
+    export TF_VAR_enable_cognito="${TF_VAR_enable_cognito:-true}"
+    POSTGRES_NEEDED=false
+    echo "  ℹ LocalStack Pro — Aurora RDS + Cognito enabled"
+else
+    export TF_VAR_aws_postgres_enabled="${TF_VAR_aws_postgres_enabled:-false}"
+    export TF_VAR_enable_cognito="${TF_VAR_enable_cognito:-false}"
+    POSTGRES_NEEDED=true
+    echo "  ℹ LocalStack Community — plain postgres container + Cognito disabled"
+fi
+# Allow explicit override to request postgres even on Pro (or suppress it on Community)
+[ "${TF_VAR_aws_postgres_enabled}" = "false" ] && POSTGRES_NEEDED=true || true
+
+# Build the docker compose command arguments.
+# The postgres service uses `profiles: ["postgres"]` so it only starts when
+# the profile is explicitly activated — preventing accidental starts.
+if [ "$POSTGRES_NEEDED" = true ]; then
+    COMPOSE_PROFILE_FLAG="--profile postgres"
+    COMPOSE_SERVICES="localstack postgres"
+else
+    COMPOSE_PROFILE_FLAG=""
+    COMPOSE_SERVICES="localstack"
+fi
+
 # `up -d --wait` blocks until every service with a healthcheck reports healthy
 # (Compose v2.20+). Falls back to a manual poll loop on older versions.
-if ! docker compose up -d --wait postgres localstack 2>/tmp/compose.err; then
+# shellcheck disable=SC2086
+if ! docker compose $COMPOSE_PROFILE_FLAG up -d --wait $COMPOSE_SERVICES 2>/tmp/compose.err; then
     echo "  ⚠ 'up -d --wait' not supported, falling back to manual readiness polling"
-    docker compose up -d postgres localstack
+    # shellcheck disable=SC2086
+    docker compose $COMPOSE_PROFILE_FLAG up -d $COMPOSE_SERVICES
 
-    echo "  Waiting for Postgres..."
-    for i in $(seq 1 30); do
-        if docker compose exec -T postgres pg_isready -q -U postgres >/dev/null 2>&1; then
-            break
-        fi
-        [ "$i" -eq 30 ] && { echo "  ✗ Postgres did not become healthy in 30s"; exit 1; }
-        sleep 1
-    done
+    if [ "$POSTGRES_NEEDED" = true ]; then
+        echo "  Waiting for Postgres..."
+        for i in $(seq 1 30); do
+            if docker compose exec -T postgres pg_isready -q -U postgres >/dev/null 2>&1; then
+                break
+            fi
+            [ "$i" -eq 30 ] && { echo "  ✗ Postgres did not become healthy in 30s"; exit 1; }
+            sleep 1
+        done
+    fi
 
     echo "  Waiting for LocalStack..."
     for i in $(seq 1 60); do
@@ -91,21 +142,16 @@ if ! docker compose up -d --wait postgres localstack 2>/tmp/compose.err; then
     done
 fi
 
-echo "  ✓ postgres   → localhost:5432 (container: workshop-postgres)"
+if [ "$POSTGRES_NEEDED" = true ]; then
+    echo "  ✓ postgres   → localhost:5432 (container: workshop-postgres)"
+fi
 echo "  ✓ localstack → localhost:4566 (container: workshop-localstack)"
 echo ""
 
 # ============================================================
-# STEP 2: Apply database migrations
+# STEP 2: Deploy backend to LocalStack
 # ============================================================
-echo "[2/5] Applying database migrations..."
-"$SCRIPT_DIR/migrate.sh" local
-echo ""
-
-# ============================================================
-# STEP 3: Deploy backend to LocalStack
-# ============================================================
-echo "[3/5] Deploying backend to LocalStack..."
+echo "[2/5] Deploying backend to LocalStack..."
 
 # Install per-service pip requirements into each service dir. LocalStack's
 # Lambda hot-reload mounts the service directory into the function container
@@ -221,6 +267,17 @@ echo ""
 echo ""
 
 # ============================================================
+# STEP 3: Apply database migrations
+# ============================================================
+# Must run AFTER deploy-backend.sh so Aurora exists in Pro mode (the
+# migrate script reads rds_endpoint_external from terraform outputs).
+# In Community mode the plain workshop-postgres container is already up
+# from step 1, so this ordering works for both flavours.
+echo "[3/5] Applying database migrations..."
+"$SCRIPT_DIR/migrate.sh" local
+echo ""
+
+# ============================================================
 # STEP 4: CORS proxy
 # ============================================================
 echo "[4/5] Starting CORS proxy on :3001..."
@@ -279,7 +336,11 @@ echo ""
 echo "============================================================"
 echo "  All services up"
 echo "============================================================"
-echo "  • postgres   → localhost:5432  (docker: workshop-postgres)"
+if [ "$POSTGRES_NEEDED" = true ]; then
+    echo "  • postgres   → localhost:5432  (docker: workshop-postgres)"
+else
+    echo "  • aurora     → LocalStack Pro (ports 4510-4559)"
+fi
 echo "  • localstack → localhost:4566  (docker: workshop-localstack)"
 echo "  • proxy      → http://localhost:3001"
 echo "  • frontend   → http://localhost:3000"

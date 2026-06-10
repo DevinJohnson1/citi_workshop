@@ -52,12 +52,12 @@ output "cognito_client_id" {
 }
 
 output "cognito_issuer_url" {
-  description = "OIDC issuer URL used by oidc-client-ts and PyJWT (empty on LocalStack)."
-  value = try(format(
-    "https://cognito-idp.%s.amazonaws.com/%s",
-    data.aws_region.this.region,
-    element(aws_cognito_user_pool.this.*.id, 0)
-  ), "")
+  description = "OIDC issuer URL used by the frontend AuthProvider and PyJWT. On LocalStack returns the LocalStack endpoint (http://); on real AWS returns the Cognito endpoint (https://). The frontend's isAuthConfigured gate requires https:// so AuthProvider is NOT mounted locally, preventing spurious OIDC discovery requests to real AWS."
+  value = local.cognito_enabled ? (
+    data.aws_caller_identity.this.id == "000000000000"
+    ? try(format("http://localhost.localstack.cloud:4566/%s", element(aws_cognito_user_pool.this.*.id, 0)), "")
+    : try(format("https://cognito-idp.%s.amazonaws.com/%s", data.aws_region.this.region, element(aws_cognito_user_pool.this.*.id, 0)), "")
+  ) : ""
 }
 
 output "cognito_domain" {
@@ -67,8 +67,26 @@ output "cognito_domain" {
 
 # --- RDS outputs (consumed by bin/migrate.sh) ---
 output "rds_endpoint" {
-  description = "Aurora cluster writer endpoint (empty on LocalStack)."
+  description = "Aurora cluster writer endpoint (empty when aws_postgres_enabled=false). On LocalStack this is the cluster DNS; for Lambda containers use rds_host_lambda instead."
   value       = try(element(aws_rds_cluster.this.*.endpoint, 0), "")
+}
+
+output "rds_host_lambda" {
+  description = "POSTGRES_HOST value injected into Lambda env vars. 'workshop-localstack' on LocalStack (Lambda containers reach LocalStack RDS via Docker network), actual endpoint on real AWS, empty when aws_postgres_enabled=false."
+  value = var.aws_postgres_enabled ? (
+    data.aws_caller_identity.this.id == "000000000000"
+    ? "workshop-localstack"
+    : try(element(aws_rds_cluster.this.*.endpoint, 0), "")
+  ) : ""
+}
+
+output "rds_endpoint_external" {
+  description = "Aurora host for external tools (bin/migrate.sh, pgAdmin). On LocalStack: 'localhost' (ports 4510-4559 are published to the host). On real AWS: the cluster writer endpoint. Empty when aws_postgres_enabled=false."
+  value = var.aws_postgres_enabled ? (
+    data.aws_caller_identity.this.id == "000000000000"
+    ? "localhost"
+    : try(element(aws_rds_cluster.this.*.endpoint, 0), "")
+  ) : ""
 }
 
 output "rds_port" {

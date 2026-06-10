@@ -130,6 +130,21 @@ def _project_owner(conn, project_id: str) -> str | None:
     return row["owner_id"] if row else None
 
 
+def _user_allocated_to_project(conn, user_id: str, project_id: str) -> bool:
+    """True if the user has any allocation row on the project (any date window).
+
+    Team members may propose deliverables on projects they're allocated to; the
+    UI marks them as ``status='todo'`` ("awaiting team-lead approval") and the
+    team lead then PATCHes the status to ``in_progress`` or ``cancelled``.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT 1 FROM allocations WHERE user_id = %s AND project_id = %s LIMIT 1",
+            (user_id, project_id),
+        )
+        return cur.fetchone() is not None
+
+
 def _create(event: Mapping[str, Any]) -> dict[str, Any]:
     user = current_user(event)
     body = DeliverableCreate(**http.parse_json_body(event))
@@ -137,8 +152,18 @@ def _create(event: Mapping[str, Any]) -> dict[str, Any]:
     owner = _project_owner(conn, body.project_id)
     if owner is None:
         return http.not_found("Project not found", event)
-    if user["role"] != "admin" and not (user["role"] == "team_lead" and owner == user["id"]):
+    is_admin = user["role"] == "admin"
+    is_owning_lead = user["role"] == "team_lead" and owner == user["id"]
+    # team_members may propose deliverables on projects they're allocated to.
+    # Force status=todo so the owning lead must approve before work starts.
+    is_allocated_member = (
+        user["role"] == "team_member"
+        and _user_allocated_to_project(conn, user["id"], body.project_id)
+    )
+    if not (is_admin or is_owning_lead or is_allocated_member):
         raise AuthError(403, "Insufficient role")
+    if is_allocated_member:
+        body = body.model_copy(update={"status": "todo"})
 
     with db.transaction() as conn, conn.cursor() as cur:
         cur.execute(

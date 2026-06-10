@@ -3,13 +3,19 @@
 Warns on over-allocation (Σ percent > 100 in any overlapping window) but
 never blocks. The reports-service computes the formal over-allocated /
 over-assigned reports.
+
+Approval workflow (added in migration 003): rows carry an
+``approval_status`` of ``pending``/``approved``/``rejected``. Allocations
+created by admin or the owning team_lead default to ``approved``; allocations
+created by a team_member (self-allocation only) are forced to ``pending``
+until an admin or owning team_lead PATCHes the status.
 """
 
 from __future__ import annotations
 
 import logging
-from datetime import date
-from typing import Any, Mapping
+from datetime import date, datetime, timezone
+from typing import Any, Literal, Mapping
 
 from pydantic import Field, ValidationError
 
@@ -21,11 +27,17 @@ _LOG = logging.getLogger()
 _LOG.setLevel(logging.INFO)
 _SERVICE = "allocations-service"
 
+ApprovalStatus = Literal["pending", "approved", "rejected"]
+
 
 class AllocationCreate(StrictModel):
-    """Body for ``POST /api/allocations-service``."""
+    """Body for ``POST /api/allocations-service``.
 
-    user_id: str
+    ``user_id`` is optional for team_member self-requests — when omitted the
+    backend fills it with the caller's id. Leads/admins must always supply it.
+    """
+
+    user_id: str | None = None
     project_id: str
     percent: int = Field(ge=1, le=100)
     start_date: date
@@ -38,6 +50,13 @@ class AllocationPatch(StrictModel):
     percent: int | None = Field(default=None, ge=1, le=100)
     start_date: date | None = None
     end_date: date | None = None
+    approval_status: ApprovalStatus | None = None
+
+
+_PROJECTION = (
+    "id, user_id, project_id, percent, start_date, end_date, created_at, "
+    "approval_status, requested_by, approved_by, approved_at"
+)
 
 
 def handler(event: Mapping[str, Any], context: Any = None) -> dict[str, Any]:
@@ -82,6 +101,8 @@ def _list(event: Mapping[str, Any]) -> dict[str, Any]:
         where.append("user_id = %s"); params.append(uid)
     if pid := qs.get("project_id"):
         where.append("project_id = %s"); params.append(pid)
+    if status := qs.get("approval_status"):
+        where.append("approval_status = %s"); params.append(status)
     limit = min(int(qs.get("limit", 20) or 20), 100)
     offset = max(int(qs.get("offset", 0) or 0), 0)
     where_sql = ("WHERE " + " AND ".join(where)) if where else ""
@@ -90,7 +111,7 @@ def _list(event: Mapping[str, Any]) -> dict[str, Any]:
         cur.execute(f"SELECT COUNT(*) AS n FROM allocations {where_sql}", params)
         total = cur.fetchone()["n"]
         cur.execute(
-            f"SELECT * FROM allocations {where_sql} "
+            f"SELECT {_PROJECTION} FROM allocations {where_sql} "
             f"ORDER BY start_date DESC LIMIT %s OFFSET %s",
             (*params, limit, offset),
         )
@@ -101,7 +122,7 @@ def _list(event: Mapping[str, Any]) -> dict[str, Any]:
 def _get(event: Mapping[str, Any], allocation_id: str) -> dict[str, Any]:
     conn = db.get_conn()
     with conn.cursor() as cur:
-        cur.execute("SELECT * FROM allocations WHERE id = %s", (allocation_id,))
+        cur.execute(f"SELECT {_PROJECTION} FROM allocations WHERE id = %s", (allocation_id,))
         row = cur.fetchone()
     if not row:
         return http.not_found(event=event)
@@ -134,6 +155,7 @@ def _overlap_warning(conn, user_id: str, start: date, end: date, percent: int,
             WHERE user_id = %s
               AND start_date <= %s
               AND end_date   >= %s
+              AND approval_status = 'approved'
               {extra_sql}
             """,
             (user_id, end, start, *extra_params),
@@ -147,24 +169,50 @@ def _create(event: Mapping[str, Any]) -> dict[str, Any]:
     body = AllocationCreate(**http.parse_json_body(event))
     if body.end_date < body.start_date:
         raise ValueError("end_date: must be on or after start_date")
-    _ensure_lead_can_write(user, body.project_id)
+
+    # Determine permission + approval status by role.
+    is_admin = user["role"] == "admin"
+    target_user_id = body.user_id or user["id"]
+
+    if is_admin:
+        approval_status = "approved"
+    elif user["role"] == "team_lead":
+        # Team leads can only allocate on projects they own.
+        _ensure_lead_can_write(user, body.project_id)
+        approval_status = "approved"
+    elif user["role"] == "team_member":
+        # Self-only. Team members may NOT allocate other people.
+        if body.user_id and body.user_id != user["id"]:
+            raise AuthError(403, "Team members may only self-request allocations")
+        target_user_id = user["id"]
+        approval_status = "pending"
+    else:
+        raise AuthError(403, "Insufficient role")
+
+    approved_by = user["id"] if approval_status == "approved" else None
+    approved_at = datetime.now(timezone.utc) if approval_status == "approved" else None
+
     with db.transaction() as conn, conn.cursor() as cur:
-        warning_pct = _overlap_warning(conn, body.user_id, body.start_date,
+        warning_pct = _overlap_warning(conn, target_user_id, body.start_date,
                                        body.end_date, body.percent)
         cur.execute(
-            """
-            INSERT INTO allocations (user_id, project_id, percent, start_date, end_date)
-            VALUES (%s, %s, %s, %s, %s)
-            RETURNING *
+            f"""
+            INSERT INTO allocations (user_id, project_id, percent, start_date, end_date,
+                                     approval_status, requested_by, approved_by, approved_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING {_PROJECTION}
             """,
-            (body.user_id, body.project_id, body.percent, body.start_date, body.end_date),
+            (target_user_id, body.project_id, body.percent, body.start_date, body.end_date,
+             approval_status, user["id"], approved_by, approved_at),
         )
         row = cur.fetchone()
-        db.audit(conn, user["id"], "allocation.created", "allocation", row["id"],
-                 {"user_id": body.user_id, "project_id": body.project_id,
-                  "overlap_pct": warning_pct})
+        db.audit(conn, user["id"],
+                 "allocation.requested" if approval_status == "pending" else "allocation.created",
+                 "allocation", row["id"],
+                 {"user_id": target_user_id, "project_id": body.project_id,
+                  "overlap_pct": warning_pct, "approval_status": approval_status})
     payload = dict(row)
-    if warning_pct > 100:
+    if warning_pct > 100 and approval_status == "approved":
         payload["warning"] = f"User over-allocated: total {warning_pct}% in this window"
     return http.created(payload, event)
 
@@ -177,11 +225,17 @@ def _patch(event: Mapping[str, Any], allocation_id: str) -> dict[str, Any]:
         raise ValueError("body: at least one field is required")
     conn = db.get_conn()
     with conn.cursor() as cur:
-        cur.execute("SELECT * FROM allocations WHERE id = %s", (allocation_id,))
+        cur.execute(f"SELECT {_PROJECTION} FROM allocations WHERE id = %s", (allocation_id,))
         existing = cur.fetchone()
     if not existing:
         return http.not_found(event=event)
     _ensure_lead_can_write(user, existing["project_id"])
+
+    # Stamp approval metadata when transitioning to approved/rejected.
+    if "approval_status" in fields and fields["approval_status"] in {"approved", "rejected"}:
+        fields["approved_by"] = user["id"]
+        fields["approved_at"] = datetime.now(timezone.utc)
+
     start = fields.get("start_date", existing["start_date"])
     end = fields.get("end_date", existing["end_date"])
     if end < start:
@@ -189,7 +243,7 @@ def _patch(event: Mapping[str, Any], allocation_id: str) -> dict[str, Any]:
     set_sql = ", ".join(f"{k} = %s" for k in fields)
     with db.transaction() as conn, conn.cursor() as cur:
         cur.execute(
-            f"UPDATE allocations SET {set_sql} WHERE id = %s RETURNING *",
+            f"UPDATE allocations SET {set_sql} WHERE id = %s RETURNING {_PROJECTION}",
             (*fields.values(), allocation_id),
         )
         row = cur.fetchone()
@@ -201,11 +255,19 @@ def _delete(event: Mapping[str, Any], allocation_id: str) -> dict[str, Any]:
     user = current_user(event)
     conn = db.get_conn()
     with conn.cursor() as cur:
-        cur.execute("SELECT project_id FROM allocations WHERE id = %s", (allocation_id,))
+        cur.execute("SELECT project_id, user_id, approval_status FROM allocations WHERE id = %s",
+                    (allocation_id,))
         existing = cur.fetchone()
     if not existing:
         return http.not_found(event=event)
-    _ensure_lead_can_write(user, existing["project_id"])
+    # Team members may withdraw their own pending self-requests.
+    is_self_pending_withdraw = (
+        user["role"] == "team_member"
+        and existing["user_id"] == user["id"]
+        and existing["approval_status"] == "pending"
+    )
+    if not is_self_pending_withdraw:
+        _ensure_lead_can_write(user, existing["project_id"])
     with db.transaction() as conn, conn.cursor() as cur:
         cur.execute("DELETE FROM allocations WHERE id = %s", (allocation_id,))
         db.audit(conn, user["id"], "allocation.deleted", "allocation", allocation_id, None)

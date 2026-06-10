@@ -1,6 +1,9 @@
 import { useEffect, useState } from 'react';
 import { useParams } from 'react-router-dom';
 import { useApi } from '../services/apiClient';
+import { DeliverablesPanel } from '../components/DeliverablesPanel';
+import { AllocationsPanel } from '../components/AllocationsPanel';
+import { BudgetPanel } from '../components/BudgetPanel';
 import type { Project } from '../types/api';
 
 type Tab = 'overview' | 'deliverables' | 'allocations' | 'budget';
@@ -89,11 +92,9 @@ export function ProjectDetailPage() {
             <div><dt className="text-gray-500">Actual end</dt><dd>{project.actual_end_date ?? '—'}</dd></div>
           </dl>
         )}
-        {activeTab !== 'overview' && (
-          <p className="text-gray-500">
-            {activeTab} tab — implement against `/api/{activeTab === 'budget' ? 'budget-service' : `${activeTab}-service`}`.
-          </p>
-        )}
+        {activeTab === 'deliverables' && <DeliverablesPanel projectId={project.id} />}
+        {activeTab === 'allocations' && <AllocationsPanel projectId={project.id} />}
+        {activeTab === 'budget' && <BudgetPanel projectId={project.id} />}
       </div>
     </section>
   );

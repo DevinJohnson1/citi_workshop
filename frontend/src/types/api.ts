@@ -58,7 +58,13 @@ export interface Allocation {
   percent: number;
   start_date: string;
   end_date: string;
+  approval_status: ApprovalStatus;
+  requested_by: string | null;
+  approved_by: string | null;
+  approved_at: string | null;
 }
+
+export type ApprovalStatus = 'pending' | 'approved' | 'rejected';
 
 export interface BudgetPlan {
   id: string;
@@ -69,4 +75,39 @@ export interface BudgetPlan {
   currency: string;
   planned_at: string;
 }
+
+/**
+ * Coarse resource taxonomy surfaced under `/resources`. The project tracks
+ * four kinds of resource: people (allocatable users), deliverables (work
+ * products), equipment (tangible assets), and budget (money). Each lives in
+ * its own table; this enum exists only to label the UI tabs / nav.
+ */
+export type ResourceKind = 'people' | 'deliverables' | 'equipment' | 'budget';
+
+/**
+ * Equipment kinds are free-form (any tangible asset — laptop, vehicle,
+ * software license, conference room, 3d-printer, …). Backed by a plain
+ * TEXT column without a CHECK constraint (see migration 003); the UI offers
+ * common values via a datalist but does not constrain the input.
+ */
+export type EquipmentKind = string;
+export type EquipmentStatus = 'available' | 'in_use' | 'maintenance' | 'retired';
+
+export interface Equipment {
+  id: string;
+  name: string;
+  kind: EquipmentKind;
+  serial_number: string | null;
+  status: EquipmentStatus;
+  assigned_project_id: string | null;
+  assigned_user_id: string | null;
+  notes: string;
+  created_at: string;
+  updated_at: string;
+  approval_status: ApprovalStatus;
+  requested_by: string | null;
+  approved_by: string | null;
+  approved_at: string | null;
+}
+
 
