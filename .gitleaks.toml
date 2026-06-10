@@ -8,12 +8,26 @@
 [extend]
 useDefault = true
 [allowlist]
-description = "Workshop placeholders and LocalStack dummies"
+description = "Workshop placeholders, LocalStack dummies, and vendored third-party packages"
 paths = [
     '''(?i)frontend/\.env\.sample$''',
     '''(?i)README\.md$''',
     '''(?i)SYSTEM_DESIGN\.md$''',
     '''(?i)docs/.*''',
+    # Pip-install artifacts under each Lambda service directory. They are no
+    # longer tracked (see .gitignore) but ARE present in git HISTORY from
+    # earlier commits, and gitleaks scans history by default. The `cryptography`
+    # package ships upstream test fixtures (private keys, certificates) that
+    # match the default secret regexes but are not project secrets.
+    '''(?i)backend/[^/]+-service/annotated_types/.*''',
+    '''(?i)backend/[^/]+-service/cffi/.*''',
+    '''(?i)backend/[^/]+-service/cryptography/.*''',
+    '''(?i)backend/[^/]+-service/jwt/.*''',
+    '''(?i)backend/[^/]+-service/psycopg(_binary(\.libs)?)?/.*''',
+    '''(?i)backend/[^/]+-service/pycparser/.*''',
+    '''(?i)backend/[^/]+-service/pydantic(_core)?/.*''',
+    '''(?i)backend/[^/]+-service/[^/]+\.dist-info/.*''',
+    '''(?i)backend/[^/]+-service/typing_extensions\.py$''',
 ]
 regexes = [
     # LocalStack ships a fixed dummy access key in every example. Never a real secret.

@@ -67,7 +67,7 @@ def reset_conn() -> None:
     try:
         if _CONN is not None and not _CONN.closed:
             _CONN.close()
-    except Exception:  # noqa: BLE001 - best-effort cleanup
+    except Exception:  # noqa: BLE001 - best-effort cleanup  # nosec B110
         pass
     _CONN = None
 

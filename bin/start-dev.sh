@@ -107,10 +107,15 @@ echo ""
 # ============================================================
 echo "[3/5] Deploying backend to LocalStack..."
 
-# Install per-service pip requirements (vendored into each service dir so the
-# Lambda zip is self-contained — see SYSTEM_DESIGN §10). LocalStack hot-reload
-# mounts the directory as-is, so the deps MUST be present on disk before the
-# function is invoked or the import crashes with HTTP 502.
+# Install per-service pip requirements into each service dir. LocalStack's
+# Lambda hot-reload mounts the service directory into the function container
+# as-is (no build step, no zip), so the deps MUST be present on disk before
+# the function is invoked — otherwise the import crashes with HTTP 502.
+#
+# These installs are LOCAL-DEV-ONLY. They are gitignored (see .gitignore
+# `backend/*-service/<dep>/` block) and excluded from the AWS deploy zip via
+# the `patterns` filter in infra/locals.tf — the Terraform Lambda module
+# reinstalls everything fresh inside the SAM build image for AWS deploys.
 #
 # We run pip inside the official AWS SAM build image for python3.11 (the Lambda
 # runtime) so the produced wheels are Linux/x86_64-compatible AND don't depend

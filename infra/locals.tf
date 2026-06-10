@@ -29,12 +29,43 @@ locals {
   ]
   python_names = {
     for name in local.python_dirs : name => {
-      name             = name
-      arch             = "x86_64"
-      runtime          = "python3.11"
-      handler          = "function.handler"
-      path             = abspath(format("%s/../backend/%s", path.module, name))
-      patterns         = ["!__pycache__/.*", "!\\..*"]
+      name    = name
+      arch    = "x86_64"
+      runtime = "python3.11"
+      handler = "function.handler"
+      path    = abspath(format("%s/../backend/%s", path.module, name))
+      # Exclude pip-install artifacts (vendored deps that bin/start-dev.sh
+      # installs into each service dir for LocalStack hot-reload) from the AWS
+      # deployment zip. The Lambda module reinstalls them fresh via
+      # build_in_docker + pip_requirements, so shipping the local copies would
+      # be redundant and could mask Linux/x86_64 wheel mismatches if the dev
+      # ran pip on a non-Lambda platform.
+      patterns = [
+        "!__pycache__/.*",
+        "!\\..*",
+        "!annotated_types/.*",
+        "!annotated_types-.*\\.dist-info/.*",
+        "!cffi/.*",
+        "!cffi-.*\\.dist-info/.*",
+        "!_cffi_backend.*\\.so",
+        "!cryptography/.*",
+        "!cryptography-.*\\.dist-info/.*",
+        "!jwt/.*",
+        "!PyJWT-.*\\.dist-info/.*",
+        "!psycopg/.*",
+        "!psycopg-.*\\.dist-info/.*",
+        "!psycopg_binary/.*",
+        "!psycopg_binary-.*\\.dist-info/.*",
+        "!psycopg_binary\\.libs/.*",
+        "!pycparser/.*",
+        "!pycparser-.*\\.dist-info/.*",
+        "!pydantic/.*",
+        "!pydantic-.*\\.dist-info/.*",
+        "!pydantic_core/.*",
+        "!pydantic_core-.*\\.dist-info/.*",
+        "!typing_extensions\\.py",
+        "!typing_extensions-.*\\.dist-info/.*",
+      ]
       pip_requirements = true
     }
   }

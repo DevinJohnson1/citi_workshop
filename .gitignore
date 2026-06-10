@@ -260,3 +260,25 @@ tfplan
 
 # Copied shared library inside each Lambda service (created by bin/deploy-backend.sh).
 backend/*/_lib/
+
+# Vendored Python dependencies installed into each Lambda service directory by
+# `bin/start-dev.sh` (`pip install --target` inside the SAM build image) for
+# LocalStack hot-reload, and re-installed by the Terraform Lambda module via
+# `build_in_docker=true` + `pip_requirements=true` for AWS deploys. These are
+# build artifacts — never commit them. The repo only tracks `function.py`,
+# `requirements.txt`, and the shared `backend/_lib/` source.
+backend/*-service/annotated_types/
+backend/*-service/cffi/
+backend/*-service/cryptography/
+backend/*-service/jwt/
+backend/*-service/psycopg/
+backend/*-service/psycopg_binary/
+backend/*-service/psycopg_binary.libs/
+backend/*-service/pycparser/
+backend/*-service/pydantic/
+backend/*-service/pydantic_core/
+backend/*-service/*.dist-info/
+backend/*-service/typing_extensions.py
+backend/*-service/_cffi_backend*.so
+backend/*-service/.pip_installed
+
