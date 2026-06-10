@@ -39,35 +39,35 @@ export function LandingPage() {
 
   return (
     <section className="space-y-4">
-      <h1 className="text-2xl font-semibold">ACME Project Tracker</h1>
-      <p className="text-gray-700 max-w-prose">
+      <h1 className="text-2xl font-semibold tracking-[-0.02em] text-content">ACME Project Tracker</h1>
+      <p className="text-content-secondary max-w-prose">
         Internal tool for tracking projects, deliverables, allocations, and budgets.
       </p>
       <div className="flex gap-3">
         {getSession() ? (
           <Link
             to="/dashboard"
-            className="rounded bg-brand-600 px-4 py-2 text-sm font-medium text-white shadow-sm hover:bg-brand-700"
+            className="rounded-md bg-accent-500 px-4 py-2 text-sm font-medium text-white shadow-sm transition-colors duration-150 hover:bg-accent-600"
           >
             Go to dashboard
           </Link>
         ) : (
           <Link
             to="/login"
-            className="rounded bg-brand-600 px-4 py-2 text-sm font-medium text-white shadow-sm hover:bg-brand-700"
+            className="rounded-md bg-accent-500 px-4 py-2 text-sm font-medium text-white shadow-sm transition-colors duration-150 hover:bg-accent-600"
           >
             Sign in
           </Link>
         )}
       </div>
-      <div className="rounded border border-gray-200 bg-white p-4 text-sm">
+      <div className="rounded-lg border border-border-subtle bg-surface-raised p-4 text-sm text-content">
         <span className="font-medium">Backend health:</span>{' '}
-        {state === 'loading' && <span className="text-gray-500">checking…</span>}
+        {state === 'loading' && <span className="text-content-secondary">checking…</span>}
         {state === 'warming' && (
-          <span className="text-amber-600">warming up (Aurora cold start can take 30s)…</span>
+          <span className="text-status-progress">warming up (Aurora cold start can take 30s)…</span>
         )}
-        {state === 'ok' && <span className="text-emerald-600">UP — {detail}</span>}
-        {state === 'error' && <span className="text-red-600">unreachable — {detail}</span>}
+        {state === 'ok' && <span className="text-status-done">UP — {detail}</span>}
+        {state === 'error' && <span className="text-status-blocked">unreachable — {detail}</span>}
       </div>
     </section>
   );
