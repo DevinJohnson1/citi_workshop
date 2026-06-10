@@ -6,7 +6,8 @@ import json
 import logging
 import os
 from postgres_service import get_postgres_version
-from mongo_service import get_mongo_version
+# NOTE: mongo_service.py was removed per SYSTEM_DESIGN Appendix B (DocumentDB
+# is out of scope). Postgres is the only datastore in v1.
 
 # Configure logging for Lambda
 logger = logging.getLogger()
@@ -22,20 +23,8 @@ PG_CONFIG = (
     f"connect_timeout=15"
 )
 
-# MongoDB configuration loaded from environment variables.
-# None when MONGO_HOST is not set (e.g. DocumentDB disabled on AWS).
-_mongo_host = os.getenv("MONGO_HOST", "")
-_mongo_user = os.getenv("MONGO_USER", "")
-_mongo_pass = os.getenv("MONGO_PASS", "")
-_is_local = os.getenv("IS_LOCAL", "false") == "true"
-MONGO_CONFIG = {
-    "host": _mongo_host,
-    "port": int(os.getenv("MONGO_PORT", "27017")),
-    "serverSelectionTimeoutMS": 5000,
-    "socketTimeoutMS": 45000,
-    **({"username": _mongo_user, "password": _mongo_pass, "authSource": os.getenv("MONGO_NAME", "admin")} if _mongo_user else {}),
-    **({"tls": True, "tlsAllowInvalidCertificates": True, "retryWrites": False} if not _is_local else {}),
-} if _mongo_host else None
+# MongoDB configuration removed (DocumentDB out of scope; see SYSTEM_DESIGN
+# Appendix B). Keep this file Postgres-only.
 
 def handler(event=None, context=None):
     """
@@ -55,22 +44,17 @@ def handler(event=None, context=None):
     logger.debug("Received context: %s", context)
 
     try:
-        # Retrieve versions from both databases
+        # Retrieve version from Postgres only (MongoDB is out of scope, see Appendix B).
         pg_version = get_postgres_version(PG_CONFIG)
-        mongo_version = get_mongo_version(MONGO_CONFIG) if MONGO_CONFIG else None
 
-        # Log retrieved versions for debugging
         logger.info("PostgreSQL Version: %s", pg_version)
-        logger.info("MongoDB Version: %s", mongo_version)
 
-        # Return successful response with database versions
         return {
             "statusCode": 200,
             "headers": {"Content-Type": "application/json"},
             "body": json.dumps({
                 "message": "Hello, World!",
                 "postgres": pg_version,
-                "mongodb": mongo_version,
             }),
         }
     except Exception as e:

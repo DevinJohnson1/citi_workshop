@@ -14,7 +14,10 @@ provider "aws" {
 
 terraform {
   backend "s3" {
-    bucket = "coding-workshop-us-east-1-abcd1234"
+    # Placeholder values — the real bucket/region are injected at `terraform init`
+    # time via `-backend-config` in bin/deploy-backend.sh, using the convention
+    # `coding-workshop-tfstate-<PARTICIPANT_ID>` in the participant's AWS region.
+    bucket = "coding-workshop-tfstate-abcd1234"
     key    = "terraform/terraform.tfstate"
   }
 

@@ -1,0 +1,83 @@
+# =============================================================================
+# Local development stack — Postgres + LocalStack, both in Docker.
+#
+# Both services attach to the user-defined "coding-workshop" network so that
+# Lambda containers spawned by LocalStack (via LAMBDA_DOCKER_NETWORK) can
+# resolve the database by its service name: postgres:5432.
+#
+# Ports are also published to the host so host-side tooling works:
+#   - psql / migrate.sh             → localhost:5432
+#   - AWS CLI / terraform / proxy   → localhost:4566
+#
+# This file is the single source of truth for local infra. setup-environment.sh
+# pre-pulls the images; start-dev.sh runs `docker compose up -d` against it.
+# =============================================================================
+
+name: coding-workshop
+
+networks:
+  workshop:
+    name: coding-workshop
+    driver: bridge
+
+volumes:
+  postgres_data:
+  localstack_data:
+
+services:
+  postgres:
+    image: postgres:17
+    container_name: workshop-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASS:-postgres123}
+      POSTGRES_DB: ${POSTGRES_NAME:-postgres}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - workshop
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_NAME:-postgres}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  localstack:
+    # Community edition by default — matches SYSTEM_DESIGN §4.1.
+    # Override via LOCALSTACK_IMAGE in .env (e.g. localstack/localstack-pro).
+    image: ${LOCALSTACK_IMAGE:-localstack/localstack:latest}
+    container_name: workshop-localstack
+    restart: unless-stopped
+    ports:
+      - "4566:4566"           # Edge / Gateway
+      - "4510-4559:4510-4559" # External service ports (e.g. Lambda Function URLs)
+    environment:
+      DEBUG: "0"
+      PERSISTENCE: "0"
+      # Attach Lambda containers to the same network so they can dial
+      # postgres:5432 by service name instead of host-gateway IP gymnastics.
+      LAMBDA_DOCKER_NETWORK: coding-workshop
+      LAMBDA_REMOVE_CONTAINERS: "true"
+      DOCKER_HOST: unix:///var/run/docker.sock
+      # LocalStack Pro auth token — required when using localstack/localstack-pro.
+      # Set LOCALSTACK_AUTH_TOKEN in your .env; safely empty for community edition.
+      LOCALSTACK_AUTH_TOKEN: ${LOCALSTACK_AUTH_TOKEN:-}
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock"
+      - "localstack_data:/var/lib/localstack"
+    networks:
+      - workshop
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:4566/_localstack/health >/dev/null || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
+

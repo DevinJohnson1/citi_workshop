@@ -15,43 +15,18 @@ locals {
     ]
   ])))
   private_subnet_ids = sort(tolist(setsubtract(data.aws_subnets.this.ids, local.public_subnet_ids)))
-  java_dirs = [
-    for file in fileset(format("%s/../backend", path.module), "*/pom.xml") :
-    dirname(file) if !startswith(dirname(file), "_") && !startswith(dirname(file), ".")
-  ]
-  nodejs_dirs = [
-    for file in fileset(format("%s/../backend", path.module), "*/package.json") :
-    dirname(file) if !startswith(dirname(file), "_") && !startswith(dirname(file), ".")
-  ]
+
+  # True when Cognito resources should exist: any real AWS account, OR when
+  # the operator explicitly opted in (LocalStack Pro). See var.enable_cognito.
+  cognito_enabled = data.aws_caller_identity.this.id != "000000000000" || var.enable_cognito
+
+  # Auto-discover Python Lambda services (SYSTEM_DESIGN §0). One level deep;
+  # underscore-prefixed dirs (_lib, _db, _examples) are excluded. Java and
+  # Node.js discovery removed per Appendix B.
   python_dirs = [
     for file in fileset(format("%s/../backend", path.module), "*/function.py") :
     dirname(file) if !startswith(dirname(file), "_") && !startswith(dirname(file), ".")
   ]
-  java_names = {
-    for name in local.java_dirs : name => {
-      name    = name
-      arch    = "x86_64"
-      runtime = "java25"
-      handler = "com.example.Handler::handleRequest"
-      path    = abspath(format("%s/../backend/%s/target", path.module, name))
-      mvn_cmd = [
-        format("cd %s", abspath(format("%s/../backend/%s", path.module, name))),
-        "mvn clean package -DskipTests",
-        format("find ./target ! -name '%s*.jar' -delete", name),
-      ]
-    }
-  }
-  nodejs_names = {
-    for name in local.nodejs_dirs : name => {
-      name             = name
-      arch             = "x86_64"
-      runtime          = "nodejs24.x"
-      handler          = "index.handler"
-      path             = abspath(format("%s/../backend/%s", path.module, name))
-      patterns         = ["node_modules/.+"]
-      npm_requirements = true
-    }
-  }
   python_names = {
     for name in local.python_dirs : name => {
       name             = name
@@ -63,7 +38,10 @@ locals {
       pip_requirements = true
     }
   }
-  function_names = merge(local.java_names, local.nodejs_names, local.python_names)
+
+  # v1 is Python-only.
+  function_names = local.python_names
+
   function_origins = [
     for name, func in local.function_names : {
       name        = func.name
@@ -72,22 +50,55 @@ locals {
     }
   ]
   origin_id = format("%s-s3-origin-%s", var.aws_project, local.app_id)
+
+  # CORS allow-list passed to every Lambda. We intentionally do NOT reference
+  # aws_cloudfront_distribution.this here: CloudFront's origins are the Lambda
+  # Function URLs, so reading its domain back into the Lambda env vars would
+  # create a graph cycle (lambda -> env_vars -> cors -> cloudfront -> lambda).
+  # Instead, allow localhost for Vite dev and "*" for the deployed environment;
+  # the Lambda handlers reflect the request Origin in their CORS responses.
+  cors_allowed_origins = join(",", compact([
+    "http://localhost:3000",
+    data.aws_caller_identity.this.id != "000000000000" ? "*" : "",
+  ]))
+
   env_vars = {
-    APP_ID        = local.app_id
-    APP_NAME      = format("%s-%s", var.aws_project, local.app_id)
-    APP_ROLE      = format("arn:%s:iam::%s:role/%s-assume-%s-%s", data.aws_partition.this.partition, data.aws_caller_identity.this.account_id, var.aws_project, data.aws_region.this.region, local.app_id)
-    APP_REGION    = data.aws_region.this.region
-    IS_LOCAL      = data.aws_caller_identity.this.id == "000000000000" ? "true" : "false"
-    POSTGRES_HOST = data.aws_caller_identity.this.id == "000000000000" ? coalesce(try(trimspace(var.aws_postgres_host), ""), "172.17.0.1") : try(element(aws_rds_cluster.this.*.endpoint, 0), "")
-    POSTGRES_PORT = data.aws_caller_identity.this.id == "000000000000" ? "5432" : try(element(aws_rds_cluster.this.*.port, 0), "")
-    POSTGRES_NAME = data.aws_caller_identity.this.id == "000000000000" ? "postgres" : try(element(aws_rds_cluster.this.*.database_name, 0), "")
-    POSTGRES_USER = data.aws_caller_identity.this.id == "000000000000" ? "postgres" : try(element(aws_rds_cluster.this.*.master_username, 0), "")
-    POSTGRES_PASS = data.aws_caller_identity.this.id == "000000000000" ? "postgres123" : try(element(aws_rds_cluster.this.*.master_password, 0), "")
-    MONGO_HOST    = data.aws_caller_identity.this.id == "000000000000" ? coalesce(try(trimspace(var.aws_mongo_host), ""), "172.17.0.1") : try(element(aws_docdb_cluster.this.*.endpoint, 0), "")
-    MONGO_PORT    = data.aws_caller_identity.this.id == "000000000000" ? "27017" : try(element(aws_docdb_cluster.this.*.port, 0), "")
-    MONGO_NAME    = data.aws_caller_identity.this.id == "000000000000" ? "mongo" : try(element(aws_docdb_cluster.this.*.database_name, 0), "")
-    MONGO_USER    = data.aws_caller_identity.this.id == "000000000000" ? "" : try(element(aws_docdb_cluster.this.*.master_username, 0), "")
-    MONGO_PASS    = data.aws_caller_identity.this.id == "000000000000" ? "" : try(element(aws_docdb_cluster.this.*.master_password, 0), "")
+    APP_ID     = local.app_id
+    APP_NAME   = format("%s-%s", var.aws_project, local.app_id)
+    APP_ROLE   = format("arn:%s:iam::%s:role/%s-assume-%s-%s", data.aws_partition.this.partition, data.aws_caller_identity.this.account_id, var.aws_project, data.aws_region.this.region, local.app_id)
+    APP_REGION = data.aws_region.this.region
+    # Local: resolves to the `postgres` service on the shared "coding-workshop"
+    # docker network (see docker-compose.yml + LAMBDA_DOCKER_NETWORK). AWS: RDS
+    # endpoint. var.aws_postgres_host remains an override hatch for unusual
+    # local topologies.
+    POSTGRES_HOST        = data.aws_caller_identity.this.id == "000000000000" ? coalesce(try(trimspace(var.aws_postgres_host), ""), "postgres") : try(element(aws_rds_cluster.this.*.endpoint, 0), "")
+    POSTGRES_PORT        = data.aws_caller_identity.this.id == "000000000000" ? "5432" : try(element(aws_rds_cluster.this.*.port, 0), "")
+    POSTGRES_NAME        = data.aws_caller_identity.this.id == "000000000000" ? "postgres" : try(element(aws_rds_cluster.this.*.database_name, 0), "")
+    POSTGRES_USER        = data.aws_caller_identity.this.id == "000000000000" ? "postgres" : try(element(aws_rds_cluster.this.*.master_username, 0), "")
+    POSTGRES_PASS        = data.aws_caller_identity.this.id == "000000000000" ? "postgres123" : try(element(aws_rds_cluster.this.*.master_password, 0), "")
+    COGNITO_USER_POOL_ID = local.cognito_enabled ? try(element(aws_cognito_user_pool.this.*.id, 0), "") : ""
+    COGNITO_CLIENT_ID    = local.cognito_enabled ? try(element(aws_cognito_user_pool_client.this.*.id, 0), "") : ""
+    # COGNITO_ISSUER_URL must match the `iss` claim that the IdP actually puts
+    # in tokens. LocalStack stamps tokens with
+    #   iss = http://localhost.localstack.cloud:4566/<pool_id>
+    # — NOT the AWS-style cognito-idp.<region>.amazonaws.com URL — so we
+    # branch on the account id to pick the right one.
+    COGNITO_ISSUER_URL = local.cognito_enabled ? (
+      data.aws_caller_identity.this.id == "000000000000"
+      ? try(format("http://localhost.localstack.cloud:4566/%s", element(aws_cognito_user_pool.this.*.id, 0)), "")
+      : try(format("https://cognito-idp.%s.amazonaws.com/%s", data.aws_region.this.region, element(aws_cognito_user_pool.this.*.id, 0)), "")
+    ) : ""
+    # COGNITO_JWKS_URL is fetched FROM INSIDE the Lambda container. On
+    # LocalStack `localhost.localstack.cloud` resolves to 127.0.0.1, which is
+    # the container itself — not LocalStack — so we must use the docker-network
+    # hostname `workshop-localstack` instead. On AWS the JWKS URL just hangs
+    # off the issuer like normal.
+    COGNITO_JWKS_URL = local.cognito_enabled ? (
+      data.aws_caller_identity.this.id == "000000000000"
+      ? try(format("http://workshop-localstack:4566/%s/.well-known/jwks.json", element(aws_cognito_user_pool.this.*.id, 0)), "")
+      : try(format("https://cognito-idp.%s.amazonaws.com/%s/.well-known/jwks.json", data.aws_region.this.region, element(aws_cognito_user_pool.this.*.id, 0)), "")
+    ) : ""
+    CORS_ALLOWED_ORIGINS = local.cors_allowed_origins
   }
   iam_arns = [
     format("arn:%s:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole", data.aws_partition.this.partition),

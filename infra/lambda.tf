@@ -11,7 +11,15 @@ module "lambda" {
   memory_size     = 128
   timeout         = 300
   tracing_mode    = "PassThrough"
-  build_in_docker = false
+  # Build the deployment package inside the official AWS SAM build image for the
+  # target runtime, so the host doesn't need a matching `python3.11` binary in
+  # PATH. Without this, the module shells out to the host interpreter and fails
+  # whenever the host Python (e.g. 3.12 / 3.13 / 3.14) differs from `runtime`.
+  # NOTE: do NOT set `docker_image` here — that flag is interpreted as a tag
+  # for `docker build` and requires `docker_build_root`/`docker_file`. Leaving
+  # it unset makes the module `docker pull` + `docker run`
+  # public.ecr.aws/sam/build-<runtime>:latest, which is what we actually want.
+  build_in_docker = true
   store_on_s3     = data.aws_caller_identity.this.id != "000000000000"
   s3_bucket       = data.aws_caller_identity.this.id != "000000000000" ? aws_s3_bucket.this.id : null
   s3_prefix       = data.aws_caller_identity.this.id != "000000000000" ? format("lambda/%s/%s/", local.app_id, each.value.name) : null
@@ -63,8 +71,6 @@ module "lambda" {
   }
 
   tags = local.app_tags
-
-  depends_on = [null_resource.java_build]
 }
 
 resource "aws_sqs_queue" "this" {
@@ -99,19 +105,3 @@ resource "null_resource" "hot_reload" {
   depends_on = [module.lambda, aws_s3_bucket.hot_reload]
 }
 
-resource "null_resource" "java_build" {
-  for_each = local.java_names
-
-  triggers = {
-    source_code_hash = md5(jsonencode({
-      for file in fileset(format("%s/../backend/%s", path.module, each.key), "**/*") :
-      file => {
-        size = try(filesize(format("%s/../backend/%s/%s", path.module, each.key, file)), 0)
-      }
-    }))
-  }
-
-  provisioner "local-exec" {
-    command = join(" && ", each.value.mvn_cmd)
-  }
-}

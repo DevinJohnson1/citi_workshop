@@ -1,0 +1,51 @@
+name: Security Check - Gitleaks
+
+on: [pull_request, push]
+
+jobs:
+  gitleaks:
+    runs-on: ubuntu-latest
+    # Official upstream image. Equivalent local invocation:
+    #   docker run --rm -v "$PWD:/repo" zricethezav/gitleaks:latest detect --source=/repo
+    container:
+      image: zricethezav/gitleaks:latest
+
+    permissions:
+      actions: read
+      contents: read
+      # security-events: write   # uncomment to upload SARIF to GitHub code scanning
+
+    steps:
+      - name: Setup GitHub Actions
+        uses: actions/checkout@master
+        with:
+          # Gitleaks scans git history, not just the working tree, so we need everything.
+          fetch-depth: 0
+
+      - name: Mark workspace as a safe git directory
+        # The gitleaks container runs as a different user than the host checkout owner,
+        # so without this git refuses to read the repo metadata.
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Run Gitleaks
+        # `detect` walks history; `--redact` ensures any printed secret is masked in CI logs.
+        # Exits non-zero when secrets are found, failing the job (matches bandit/checkov pattern).
+        run: |
+          gitleaks detect \
+            --source="$GITHUB_WORKSPACE" \
+            --config="$GITHUB_WORKSPACE/.gitleaks.toml" \
+            --redact \
+            --no-banner \
+            --report-format=sarif \
+            --report-path=gitleaks.sarif \
+            --exit-code=1
+
+      - name: Upload Gitleaks SARIF artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gitleaks-sarif
+          path: gitleaks.sarif
+          if-no-files-found: ignore
+
+

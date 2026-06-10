@@ -79,7 +79,25 @@ else
     export AWS_REGION=us-east-1
     unset AWS_SESSION_TOKEN
 
-    BUCKET_NAME="coding-workshop-tfstate-${PARTICIPANT_ID:-abcd1234}"
+    # Ensure PARTICIPANT_ID is exported so the shared `terraform init` branch
+    # below passes a matching `-backend-config bucket=...` override instead of
+    # falling back to the placeholder in infra/provider.tf.
+    export PARTICIPANT_ID="${PARTICIPANT_ID:-abcd1234}"
+
+    # Auto-enable Cognito resources when the operator is running LocalStack Pro
+    # (community edition returns 501 Not Implemented for cognito-idp). Detection
+    # is best-effort: if LOCALSTACK_IMAGE contains "pro", flip the TF var.
+    # Sourced from .env via docker compose; we re-read it here for parity.
+    if [ -f "$PROJECT_ROOT/.env" ]; then
+        # shellcheck disable=SC1090
+        set -a; . "$PROJECT_ROOT/.env"; set +a
+    fi
+    if [[ "${LOCALSTACK_IMAGE:-}" == *pro* ]]; then
+        export TF_VAR_enable_cognito=true
+        echo "INFO: LocalStack Pro detected — enabling Cognito (TF_VAR_enable_cognito=true)"
+    fi
+
+    BUCKET_NAME="coding-workshop-tfstate-${PARTICIPANT_ID}"
     if ! aws s3 ls | grep -q "$BUCKET_NAME"; then
         aws s3 mb "s3://$BUCKET_NAME"
     fi
@@ -96,6 +114,18 @@ else
 fi
 
 # Apply Terraform configuration automatically
+# Bundle backend/_lib/ into every backend/<svc>/_lib/ so each Lambda zip ships
+# with its own copy (no symlinks — they break on Windows). The copied folders
+# are gitignored. See SYSTEM_DESIGN §10 "Lambda packaging".
+LIB_SRC="$PROJECT_ROOT/backend/_lib"
+if [ -d "$LIB_SRC" ]; then
+    for svc in "$PROJECT_ROOT"/backend/*/function.py; do
+        d="$(dirname "$svc")"
+        case "$(basename "$d")" in _*) continue ;; esac
+        rsync -a --delete "$LIB_SRC/" "$d/_lib/"
+    done
+fi
+
 terraform apply -auto-approve
 echo "INFO: Infrastructure deployment complete!"
 

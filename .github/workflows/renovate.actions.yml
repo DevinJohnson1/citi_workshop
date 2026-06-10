@@ -1,0 +1,50 @@
+name: Renovate
+
+# Runs the self-hosted Renovate container so this repo doesn't depend on the
+# Mend Renovate GitHub App being installed. Policy lives in `renovate.json`:
+# only HIGH/CRITICAL vulnerability fixes produce PRs; routine updates are off.
+#
+# Required repository secret:
+#   RENOVATE_TOKEN — a PAT (or fine-grained token) with repo + workflow scope.
+#                    Renovate uses it to open PRs and read vulnerability alerts.
+
+on:
+  schedule:
+    # Hourly — Renovate is cheap; gating happens via the severity filter.
+    - cron: '0 * * * *'
+  workflow_dispatch:
+    inputs:
+      logLevel:
+        description: 'Renovate log level'
+        required: false
+        default: 'info'
+        type: choice
+        options: [debug, info, warn, error]
+
+concurrency:
+  group: renovate
+  cancel-in-progress: true
+
+jobs:
+  renovate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Setup GitHub Actions
+        uses: actions/checkout@master
+
+      - name: Run Renovate
+        uses: renovatebot/github-action@v40.3.6
+        with:
+          configurationFile: renovate.json
+          token: ${{ secrets.RENOVATE_TOKEN }}
+        env:
+          LOG_LEVEL: ${{ inputs.logLevel || 'info' }}
+          # Limit scope to this repo only.
+          RENOVATE_REPOSITORIES: ${{ github.repository }}
+          # Ensure vulnerability alerts are read from GitHub's dependency graph.
+          RENOVATE_VULNERABILITY_ALERTS: 'true'
+          RENOVATE_OSV_VULNERABILITY_ALERTS: 'true'
+

@@ -1,561 +1,290 @@
 #!/usr/bin/env bash
-# Script: Comprehensive Local Development Environment Startup
-# Purpose: Validate and start all components (MongoDB, LocalStack, Backend, Frontend)
-# Usage: ./start-dev.sh
+# Script: Local Development Environment Startup
+# Purpose: Boot the full local stack — Postgres + LocalStack (both in Docker
+#          via docker-compose.yml), apply DB migrations, deploy backend Lambdas
+#          to LocalStack, start the CORS proxy, then hand off to Vite.
+# Usage:   ./bin/start-dev.sh
 
 set -e
 
-# Usage helper
-if [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
-    echo "Usage: $0"
-    echo "Start comprehensive local development environment"
-    echo ""
-    echo "Description:"
-    echo "  Validates and starts all required services:"
-    echo "  1. PostgreSQL (with proper binding)"
-    echo "  2. MongoDB (with proper binding)"
-    echo "  3. LocalStack (AWS services emulation)"
-    echo "  4. Backend infrastructure (Terraform + Lambda)"
-    echo "  5. Frontend development server (React)"
-    echo ""
-    echo "Options:"
-    echo "  -h, --help      Show this help message"
-    echo ""
-    echo "Requirements:"
-    echo "  - postgres installed"
-    echo "  - mongod installed"
-    echo "  - npm installed"
-    echo "  - localstack installed"
+if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
+    cat <<'USAGE'
+Usage: bin/start-dev.sh
+Starts the local dev stack and the React dev server.
+
+Steps:
+  1. docker compose up -d postgres localstack   (waits for health)
+  2. bin/migrate.sh local                       (applies SQL migrations)
+  3. bin/deploy-backend.sh local                (terraform apply against LocalStack)
+  4. bin/generate-env.sh + CORS proxy on :3001
+  5. npm run dev                                (Vite on :3000)
+
+Requirements: docker (with compose plugin), terraform, node, npm.
+            (psql is NOT required on the host — migrate.sh runs it inside the container.)
+USAGE
     exit 0
 fi
 
 echo "==================================================="
-echo "Comprehensive Local Development Environment Startup"
+echo "Local Development Environment Startup"
 echo "==================================================="
 echo ""
 
-# Resolve script directory and project root paths
-SCRIPT_DIR="$(cd "$(dirname "$0")" > /dev/null 2>&1 || exit 1; pwd -P)"
-PROJECT_ROOT="$(cd $SCRIPT_DIR/.. > /dev/null 2>&1 || exit 1; pwd -P)"
-
-# Define project directories
+SCRIPT_DIR="$(cd "$(dirname "$0")" >/dev/null 2>&1; pwd -P)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." >/dev/null 2>&1; pwd -P)"
 INFRA_DIR="$PROJECT_ROOT/infra"
 FRONTEND_DIR="$PROJECT_ROOT/frontend"
 
-# Ensure local development
+# LocalStack endpoints — every aws/terraform invocation in this script targets
+# the dockerized LocalStack on :4566.
 export AWS_ENDPOINT_URL="http://localhost:4566"
 export AWS_ENDPOINT_URL_S3="http://s3.localhost.localstack.cloud:4566"
+export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-test}"
+export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-test}"
+export AWS_REGION="${AWS_REGION:-us-east-1}"
+unset AWS_SESSION_TOKEN
 
 # ============================================================
-# STEP 1: Check and Start PostgreSQL
+# STEP 1: Start Postgres + LocalStack via Docker Compose
 # ============================================================
-echo -e "[1/5] Checking PostgreSQL..."
+echo "[1/5] Starting Docker containers (postgres + localstack)..."
 
-if ! command -v psql &> /dev/null; then
-    echo -e "ERROR: PostgreSQL (psql) is not installed"
-    echo "Install: brew install postgresql@16 (Mac) or sudo apt install postgresql (Linux)"
-    exit 1
+command -v docker >/dev/null 2>&1 || { echo "ERROR: docker is not installed (run bin/setup-environment.sh)"; exit 1; }
+docker info >/dev/null 2>&1 || { echo "ERROR: docker daemon is not running"; exit 1; }
+docker compose version >/dev/null 2>&1 || { echo "ERROR: docker compose plugin is not installed"; exit 1; }
+# Fail fast if node/npm are missing — steps 4 (CORS proxy) and 5 (Vite) need them.
+command -v node >/dev/null 2>&1 || { echo "ERROR: node is not installed or not in PATH (needed by bin/proxy-server.js and Vite). Install Node.js 20+ and retry."; exit 1; }
+command -v npm  >/dev/null 2>&1 || { echo "ERROR: npm is not installed or not in PATH."; exit 1; }
+
+cd "$PROJECT_ROOT"
+
+# Auto-seed .env from .env.example on first run so `docker compose` picks up
+# the workshop defaults (POSTGRES_USER, POSTGRES_PASS, ...). Participants can
+# edit .env afterwards; we never overwrite an existing one.
+if [ ! -f .env ] && [ -f .env.example ]; then
+    cp .env.example .env
+    echo "  ℹ Created .env from .env.example (edit it to override workshop defaults)"
 fi
 
-PG_OK=false
+# `up -d --wait` blocks until every service with a healthcheck reports healthy
+# (Compose v2.20+). Falls back to a manual poll loop on older versions.
+if ! docker compose up -d --wait postgres localstack 2>/tmp/compose.err; then
+    echo "  ⚠ 'up -d --wait' not supported, falling back to manual readiness polling"
+    docker compose up -d postgres localstack
 
-if pg_isready -q; then
-    # Check if bound to 0.0.0.0 so Docker Lambda containers can reach it
-    if ss -ltn 2>/dev/null | grep -q '0.0.0.0:5432'; then
-        PG_OK=true
-        echo -e "  ✓ PostgreSQL is running and bound to 0.0.0.0:5432"
-    else
-        echo -e "  ⚠ PostgreSQL running but not bound to 0.0.0.0, reconfiguring..."
-    fi
-fi
-
-if [ "$PG_OK" = false ]; then
-    if [[ "$(uname)" == "Darwin" ]]; then
-        PG_SERVICE=$(brew services list 2>/dev/null | awk '/^postgresql/ {print $1}' | head -1)
-        if [ -z "$PG_SERVICE" ]; then
-            echo -e "  ✗ No PostgreSQL brew service found. Install: brew install postgresql@16"
-            exit 1
-        fi
-        PG_DATA_DIR="/opt/homebrew/var/${PG_SERVICE}"
-        if [ ! -d "$PG_DATA_DIR" ] || [ -z "$(ls -A "$PG_DATA_DIR" 2>/dev/null)" ]; then
-            echo -e "  ⚠ PostgreSQL data directory not found, initializing..."
-            initdb "$PG_DATA_DIR" || { echo -e "  ✗ Failed to initialize PostgreSQL data directory"; exit 1; }
-        fi
-        brew services restart "$PG_SERVICE" || { echo -e "  ✗ Failed to start PostgreSQL"; exit 1; }
-    else
-        PG_CONF=$(find /etc/postgresql -name "postgresql.conf" 2>/dev/null | head -1)
-        PG_SERVICE=$(systemctl list-units --type=service --all 2>/dev/null | awk '/postgresql/ {print $1}' | head -1)
-        if [ -z "$PG_SERVICE" ]; then
-            echo -e "  ✗ No PostgreSQL systemctl service found. Install: sudo apt install postgresql"
-            exit 1
-        fi
-
-        PG_HBA=$(find /etc/postgresql -name "pg_hba.conf" 2>/dev/null | head -1)
-        [ -n "$PG_CONF" ] && sudo sed -i "s/#\?listen_addresses\s*=\s*'[^']*'/listen_addresses = '*'/" "$PG_CONF"
-        # Allow all hosts to connect (local dev only)
-        if [ -n "$PG_HBA" ] && ! sudo grep -q "0.0.0.0/0" "$PG_HBA"; then
-            echo "host all all 0.0.0.0/0 trust" | sudo tee -a "$PG_HBA" > /dev/null
-        fi
-        sudo systemctl restart "$PG_SERVICE" || { echo -e "  ✗ Failed to restart PostgreSQL"; exit 1; }
-    fi
-
-    # Wait for PostgreSQL to be ready and bound
-    for i in {1..10}; do
-        if pg_isready -q && ss -ltn 2>/dev/null | grep -q '0.0.0.0:5432'; then
-            echo -e "  ✓ PostgreSQL started and bound to 0.0.0.0:5432"
+    echo "  Waiting for Postgres..."
+    for i in $(seq 1 30); do
+        if docker compose exec -T postgres pg_isready -q -U postgres >/dev/null 2>&1; then
             break
         fi
-        if [ "$i" -eq 10 ]; then
-            echo -e "  ✗ PostgreSQL failed to start within 10 seconds"
-            exit 1
+        [ "$i" -eq 30 ] && { echo "  ✗ Postgres did not become healthy in 30s"; exit 1; }
+        sleep 1
+    done
+
+    echo "  Waiting for LocalStack..."
+    for i in $(seq 1 60); do
+        if curl -sf http://localhost:4566/_localstack/health >/dev/null 2>&1; then
+            break
         fi
+        [ "$i" -eq 60 ] && { echo "  ✗ LocalStack did not become healthy in 60s"; exit 1; }
         sleep 1
     done
 fi
 
+echo "  ✓ postgres   → localhost:5432 (container: workshop-postgres)"
+echo "  ✓ localstack → localhost:4566 (container: workshop-localstack)"
 echo ""
 
 # ============================================================
-# STEP 2: Check and Start MongoDB
+# STEP 2: Apply database migrations
 # ============================================================
-echo -e "[2/5] Checking MongoDB..."
-
-# Check if mongod is installed
-if ! command -v mongod &> /dev/null; then
-    echo -e "ERROR: MongoDB (mongod) is not installed"
-    echo "Install: apt-get install mongodb (Linux) or brew tap mongodb/brew && brew install mongodb-community (Mac)"
-    exit 1
-fi
-
-# Check if MongoDB is running and properly bound
-MONGODB_OK=false
-
-if pgrep -x "mongod" > /dev/null; then
-    # MongoDB process exists, check binding
-    if command -v ss &> /dev/null; then
-        # Use ss (works without sudo on Linux)
-        if ss -ltn | grep -q '0.0.0.0:27017'; then
-            MONGODB_OK=true
-        fi
-    elif command -v netstat &> /dev/null && [[ "$(uname)" != "Darwin" ]]; then
-        # Fall back to netstat (Linux only - macOS netstat has different output format)
-        if netstat -ltn 2>/dev/null | grep -q '0.0.0.0:27017'; then
-            MONGODB_OK=true
-        fi
-    fi
-
-    # On macOS or if above checks failed, check process arguments for bind_ip
-    if [ "$MONGODB_OK" = false ]; then
-        if ps -p $(pgrep -x "mongod") -o args= 2>/dev/null | grep -q "bind_ip 0.0.0.0\|bind_ip=0.0.0.0"; then
-            MONGODB_OK=true
-        fi
-    fi
-
-    # Final fallback: try to connect directly
-    if [ "$MONGODB_OK" = false ]; then
-        if mongosh --quiet --eval "db.adminCommand({ping:1}).ok" > /dev/null 2>&1; then
-            MONGODB_OK=true
-        fi
-    fi
-fi
-
-if [ "$MONGODB_OK" = true ]; then
-    echo -e "  ✓ MongoDB is running and bound to 0.0.0.0:27017"
-
-    # Verify it's actually accessible
-    if ! mongosh --quiet --eval "db.adminCommand({ping:1}).ok" > /dev/null 2>&1; then
-        echo -e "  ✗ MongoDB is running but not responding to ping"
-        exit 1
-    fi
-    echo -e "  ✓ MongoDB connection verified"
-else
-    echo -e "  ⚠ MongoDB not running or not bound to 0.0.0.0, starting it..."
-
-    # Kill any existing mongod that's not properly configured
-    if pgrep -x "mongod" > /dev/null; then
-        echo -e "  ⚠ Stopping misconfigured MongoDB..."
-        PID=$(pgrep -x "mongod" || true)
-        if [ -n "$PID" ]; then
-            OWNER=$(ps -o user= -p "$PID" | tr -d ' ')
-            if [ "$OWNER" != "$(whoami)" ]; then
-                echo -e "    MongoDB is running as ${OWNER}, attempting sudo stop..."
-                if command -v systemctl &> /dev/null && systemctl list-units --type=service --all | grep -q mongod; then
-                    sudo systemctl stop mongod || true
-                else
-                    sudo kill "$PID" || true
-                fi
-            else
-                kill "$PID" || true
-            fi
-            sleep 2
-        fi
-    fi
-
-    # Determine data and log directories based on OS
-    if [[ "$OSTYPE" == "linux-gnu"* ]]; then
-        DATA_DIR="/var/lib/mongodb"
-        LOG_DIR="/var/log/mongodb"
-        # Try to create directories with sudo if needed
-        if [ ! -d "$DATA_DIR" ]; then
-            mkdir -p "$DATA_DIR" 2>/dev/null || sudo mkdir -p "$DATA_DIR"
-        fi
-        if [ ! -d "$LOG_DIR" ]; then
-            mkdir -p "$LOG_DIR" 2>/dev/null || sudo mkdir -p "$LOG_DIR"
-        fi
-        # Ensure current user owns the directories
-        sudo chown -R $(whoami):$(whoami) "$DATA_DIR" "$LOG_DIR" 2>/dev/null || true
-    else
-        # Mac
-        DATA_DIR="/usr/local/var/mongodb"
-        LOG_DIR="/usr/local/var/log/mongodb"
-        mkdir -p "$DATA_DIR" "$LOG_DIR"
-    fi
-
-    # Start MongoDB with correct binding
-    echo -e "  Starting MongoDB with --bind_ip 0.0.0.0..."
-    mongod --dbpath "$DATA_DIR" --bind_ip 0.0.0.0 --port 27017 --fork --logpath "$LOG_DIR/mongo.log"
-    sleep 3
-
-    # Verify it started correctly
-    if ! mongosh --quiet --eval "db.adminCommand({ping:1}).ok" > /dev/null 2>&1; then
-        echo -e "  ✗ MongoDB failed to start properly"
-        echo -e "  Log tail:"
-        tail -n 20 "$LOG_DIR/mongo.log" | sed 's/^/    /'
-        exit 1
-    fi
-
-    echo -e "  ✓ MongoDB started and verified"
-fi
-
+echo "[2/5] Applying database migrations..."
+"$SCRIPT_DIR/migrate.sh" local
 echo ""
 
 # ============================================================
-# STEP 3: Check and Start LocalStack
+# STEP 3: Deploy backend to LocalStack
 # ============================================================
-echo -e "[3/5] Checking LocalStack..."
+echo "[3/5] Deploying backend to LocalStack..."
 
-# Check if localstack is installed
-if ! command -v localstack &> /dev/null; then
-    echo -e "ERROR: LocalStack is not installed"
-    echo "Install: pip install localstack"
-    exit 1
-fi
-
-# Check if Docker is running
-if ! docker info > /dev/null 2>&1; then
-    echo -e "ERROR: Docker is not running"
-    echo "  Please start Docker Desktop and try again"
-    exit 1
-fi
-echo -e "  ✓ Docker is running"
-
-# Check if LocalStack is running
-LOCALSTACK_OK=false
-LOCALSTACK_IMAGE="${LOCALSTACK_IMAGE:-localstack/localstack-pro}"
-if curl -s http://localhost:4566/_localstack/health > /dev/null 2>&1; then
-    # Verify the correct image is running
-    RUNNING_IMAGE=$(docker inspect localstack-main --format '{{.Config.Image}}' 2>/dev/null || echo "")
-    if [ "$RUNNING_IMAGE" != "$LOCALSTACK_IMAGE" ]; then
-        echo -e "  ⚠ LocalStack running with wrong image ($RUNNING_IMAGE), expected $LOCALSTACK_IMAGE. Restarting..."
-        localstack stop
-        docker stop localstack-main 2>/dev/null || true
-        sleep 5
-    else
-        LOCALSTACK_OK=true
-        echo -e "  ✓ LocalStack is running ($LOCALSTACK_IMAGE)"
-    fi
-fi
-
-if [ "$LOCALSTACK_OK" = false ]; then
-    # Check if LocalStack docker container is already running
-    if docker ps | grep -q localstack-main; then
-        echo -e "  ⚠ Stopping existing LocalStack container..."
-        localstack stop || echo "WARNING: localstack stop didn't work"
-        docker stop localstack-main || echo "WARNING: docker stop localstack-main didn't work"
-        sleep 10
-    fi
-
-    echo -e "  ⚠ LocalStack not running, starting it..."
-    localstack start -d
-
-    # Wait for LocalStack to be ready (up to 30 seconds)
-    for i in {1..30}; do
-        if curl -s http://localhost:4566/_localstack/health > /dev/null 2>&1; then
-            LOCALSTACK_OK=true
-            echo -e "  ✓ LocalStack started"
-            break
-        fi
-        echo -e "  Waiting for LocalStack... ($i/30)"
-        sleep 1
-    done
-
-    if [ "$LOCALSTACK_OK" = false ]; then
-        echo -e "  ✗ LocalStack failed to start within 30 seconds"
-        exit 1
-    fi
-fi
-
-# Verify LocalStack services
-HEALTH=$(curl -s http://localhost:4566/_localstack/health 2>/dev/null || echo "{}")
-LAMBDA_STATUS=$(echo "$HEALTH" | grep -o '"lambda":"[^"]*"' | cut -d'"' -f4 || echo "unknown")
-S3_STATUS=$(echo "$HEALTH" | grep -o '"s3":"[^"]*"' | cut -d'"' -f4 || echo "unknown")
-
-if [ "$LAMBDA_STATUS" != "available" ] && [ "$LAMBDA_STATUS" != "running" ]; then
-    echo -e "  ⚠ Lambda service status: $LAMBDA_STATUS"
-fi
-
-if [ "$S3_STATUS" != "available" ] && [ "$S3_STATUS" != "running" ]; then
-    echo -e "  ⚠ S3 service status: $S3_STATUS"
-fi
-
-echo -e "  ✓ LocalStack services verified"
-echo ""
-
-# ============================================================
-# STEP 4: Check and Deploy Backend
-# ============================================================
-echo -e "[4/5] Checking Backend Infrastructure..."
-
-# Detect MongoDB host for LocalStack Lambda functions
-if [[ "$OSTYPE" == "linux-gnu"* ]]; then
-    export TF_VAR_aws_mongo_host="172.17.0.1"
-    export TF_VAR_aws_postgres_host="172.17.0.1"
-    echo -e "  Detected Linux - using host: 172.17.0.1"
-else
-    export TF_VAR_aws_mongo_host="host.docker.internal"
-    export TF_VAR_aws_postgres_host="host.docker.internal"
-    echo -e "  Detected Mac/Windows - using host: host.docker.internal"
-fi
-
-# Install pip requirements into each Python service directory for hot-reload
-# Skip if requirements.txt hasn't changed since last install (avoids slow PyPI lookups)
+# Install per-service pip requirements (vendored into each service dir so the
+# Lambda zip is self-contained — see SYSTEM_DESIGN §10). LocalStack hot-reload
+# mounts the directory as-is, so the deps MUST be present on disk before the
+# function is invoked or the import crashes with HTTP 502.
+#
+# We run pip inside the official AWS SAM build image for python3.11 (the Lambda
+# runtime) so the produced wheels are Linux/x86_64-compatible AND don't depend
+# on the host Python version (host Pythons 3.13/3.14 cannot install psycopg
+# binaries pinned to 3.11/3.12 wheel matrices).
 shopt -s nullglob
+
+# Always bundle backend/_lib/ into each service dir BEFORE we look at whether
+# the backend is "already deployed" — without this, function.py crashes at
+# import time inside the Lambda container with `ModuleNotFoundError: _lib`,
+# which surfaces as a generic HTTP 502 from the Function URL.
+LIB_SRC="$PROJECT_ROOT/backend/_lib"
+if [ -d "$LIB_SRC" ] && command -v rsync >/dev/null 2>&1; then
+    for svc in "$PROJECT_ROOT"/backend/*/function.py; do
+        d="$(dirname "$svc")"
+        case "$(basename "$d")" in _*) continue ;; esac
+        rsync -a --delete "$LIB_SRC/" "$d/_lib/"
+    done
+fi
+
+PIP_IMAGE="public.ecr.aws/sam/build-python3.11:latest"
 for req in "$PROJECT_ROOT"/backend/*/requirements.txt; do
     svc_dir="$(dirname "$req")"
+    [[ "$(basename "$svc_dir")" == _* ]] && continue
     REQS_HASH=$(md5sum "$req" 2>/dev/null | cut -d' ' -f1)
     HASH_FILE="$svc_dir/.pip_installed"
     if [ "$(cat "$HASH_FILE" 2>/dev/null)" = "$REQS_HASH" ]; then
-        echo -e "  pip requirements for $(basename "$svc_dir") already up to date, skipping..."
         continue
     fi
-    echo -e "  Installing pip requirements for $(basename "$svc_dir")..."
-    pip install --quiet --target="$svc_dir" -r "$req" 2>/dev/null || true
+    echo "  Installing pip requirements for $(basename "$svc_dir") (docker / python3.11)..."
+    docker run --rm \
+        -v "$svc_dir":/var/task \
+        --entrypoint /bin/sh \
+        "$PIP_IMAGE" \
+        -c 'pip install --quiet --upgrade --target=/var/task -r /var/task/requirements.txt' \
+      || { echo "  ✗ pip install failed for $(basename "$svc_dir")"; exit 1; }
     echo "$REQS_HASH" > "$HASH_FILE"
-done
-
-# Install npm dependencies into each Node.js service directory for hot-reload
-for pkg in "$PROJECT_ROOT"/backend/*/package.json; do
-    svc_dir="$(dirname "$pkg")"
-    echo -e "  Installing npm dependencies for $(basename "$svc_dir")..."
-    npm install --prefix "$svc_dir" --silent 2>/dev/null || true
 done
 shopt -u nullglob
 
-# Change to infrastructure directory
 cd "$INFRA_DIR"
 
-# Load participant configuration (provides PARTICIPANT_ID, TF_VAR_aws_app_code, etc.)
 PARTICIPANT_CONFIG="$PROJECT_ROOT/ENVIRONMENT.config"
-if [ -f "$PARTICIPANT_CONFIG" ]; then
-    source "$PARTICIPANT_CONFIG"
-fi
+[ -f "$PARTICIPANT_CONFIG" ] && source "$PARTICIPANT_CONFIG"
 
-# Override credentials for LocalStack
-export AWS_ENDPOINT_URL="http://localhost:4566"
-export AWS_ENDPOINT_URL_S3="http://s3.localhost.localstack.cloud:4566"
-export AWS_ACCESS_KEY_ID=test
-export AWS_SECRET_ACCESS_KEY=test
-export AWS_REGION=us-east-1
-unset AWS_SESSION_TOKEN
-
-# Ensure the Terraform state bucket exists in LocalStack
 BUCKET_NAME="coding-workshop-tfstate-${PARTICIPANT_ID:-abcd1234}"
 if ! aws s3 ls 2>/dev/null | grep -q "$BUCKET_NAME"; then
-    echo -e "  Creating Terraform state bucket: $BUCKET_NAME"
-    aws s3 mb "s3://$BUCKET_NAME" > /dev/null 2>&1 || {
-        echo -e "  ✗ Failed to create Terraform state bucket"
+    echo "  Creating Terraform state bucket: $BUCKET_NAME"
+    aws s3 mb "s3://$BUCKET_NAME" >/dev/null 2>&1 || {
+        echo "  ✗ Failed to create Terraform state bucket"
         exit 1
     }
 fi
 
-# Ensure terraform is initialized against the correct LocalStack backend
 terraform init -reconfigure \
     -backend-config="bucket=$BUCKET_NAME" \
-    -backend-config="region=${AWS_REGION:-us-east-1}" \
-    > /tmp/tf-init.log 2>&1 || {
-    echo -e "  ✗ Terraform init failed:"
+    -backend-config="region=${AWS_REGION}" >/tmp/tf-init.log 2>&1 || {
+    echo "  ✗ Terraform init failed:"
     tail -n 20 /tmp/tf-init.log | sed 's/^/    /'
     exit 1
 }
 
-
-# Count services on disk vs deployed
-SERVICES_ON_DISK=$(find "$PROJECT_ROOT/backend" -mindepth 2 -maxdepth 2 \( -name "function.py" -o -name "package.json" -o -name "pom.xml" \) -not -path "*/_*" -not -path "*/\.*" | wc -l)
+SERVICES_ON_DISK=$(find "$PROJECT_ROOT/backend" -mindepth 2 -maxdepth 2 -name "function.py" -not -path "*/_*" | wc -l)
 SERVICES_DEPLOYED=$(terraform output -json lambda_urls 2>/dev/null | grep -o 'http://[^"]*' | wc -l)
 
-# Check if backend is deployed and all services are present
 BACKEND_OK=false
 if [ "$SERVICES_DEPLOYED" -ge "$SERVICES_ON_DISK" ] && [ "$SERVICES_DEPLOYED" -gt 0 ]; then
-    LAMBDA_URLS=$(terraform output -json lambda_urls 2>/dev/null | grep -o 'http://[^"]*' | head -1 || echo "")
-    if [ -n "$LAMBDA_URLS" ]; then
-        # Check if Lambda responds with any HTTP status (200 or 500 both mean it's running)
-        HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$LAMBDA_URLS" 2>/dev/null || echo "000")
-        if [ "$HTTP_STATUS" != "000" ]; then
-            BACKEND_OK=true
-            echo -e "  ✓ Backend is deployed and functions are responding ($SERVICES_DEPLOYED/$SERVICES_ON_DISK services)"
-        else
-            echo -e "  ⚠ Backend is deployed but functions not responding"
-        fi
+    LAMBDA_URL=$(terraform output -json lambda_urls 2>/dev/null | grep -o 'http://[^"]*' | head -1 || echo "")
+    if [ -n "$LAMBDA_URL" ] && [ "$(curl -s -o /dev/null -w '%{http_code}' "$LAMBDA_URL" 2>/dev/null)" != "000" ]; then
+        BACKEND_OK=true
+        echo "  ✓ Backend already deployed ($SERVICES_DEPLOYED/$SERVICES_ON_DISK services)"
     fi
-else
-    echo -e "  ⚠ Services on disk ($SERVICES_ON_DISK) vs deployed ($SERVICES_DEPLOYED) — redeploying..."
 fi
 
 if [ "$BACKEND_OK" = false ]; then
-    echo -e "  ⚠ Backend not deployed or not working, deploying..."
-
-    # Deploy backend
-    $SCRIPT_DIR/deploy-backend.sh local > /tmp/backend-deploy.log 2>&1 || {
-        echo -e "  ⚠ Backend deployment failed, resetting LocalStack and retrying..."
-
-        # Stop LocalStack, clear stale state, restart
-        localstack stop 2>/dev/null || true
-        docker stop localstack-main 2>/dev/null || true
-        sleep 5
-        localstack start -d
-
-        # Wait for LocalStack to be ready
-        for i in {1..30}; do
-            if curl -s http://localhost:4566/_localstack/health > /dev/null 2>&1; then
-                echo -e "  ✓ LocalStack restarted"
-                break
-            fi
-            if [ "$i" -eq 30 ]; then
-                echo -e "  ✗ LocalStack failed to restart"
-                exit 1
-            fi
+    echo "  Deploying backend..."
+    "$SCRIPT_DIR/deploy-backend.sh" local >/tmp/backend-deploy.log 2>&1 || {
+        echo "  ⚠ Backend deploy failed, restarting LocalStack and retrying..."
+        cd "$PROJECT_ROOT"
+        docker compose restart localstack
+        for i in $(seq 1 60); do
+            curl -sf http://localhost:4566/_localstack/health >/dev/null 2>&1 && break
+            [ "$i" -eq 60 ] && { echo "  ✗ LocalStack failed to restart"; exit 1; }
             sleep 1
         done
-
-        # Retry deploy against clean LocalStack
-        $SCRIPT_DIR/deploy-backend.sh local > /tmp/backend-deploy.log 2>&1 || {
-            echo -e "  ✗ Backend deployment failed after LocalStack reset"
+        cd "$INFRA_DIR"
+        "$SCRIPT_DIR/deploy-backend.sh" local >/tmp/backend-deploy.log 2>&1 || {
+            echo "  ✗ Backend deploy failed after LocalStack restart"
             tail -n 50 /tmp/backend-deploy.log | sed 's/^/    /'
             exit 1
         }
     }
-
-    echo -e "  ✓ Backend deployed successfully"
+    echo "  ✓ Backend deployed"
 fi
 
-# Display Lambda URLs
-echo -e "  Lambda Function URLs:"
+echo "  Lambda Function URLs:"
 terraform output -json lambda_urls 2>/dev/null | grep -o 'http://[^"]*' | sed 's/^/    /' || echo "    (none)"
+echo ""
 
+# Seed the four workshop personas into Cognito (idempotent, no-op when Cognito
+# isn't deployed e.g. on LocalStack Community with TF_VAR_enable_cognito=false).
+"$SCRIPT_DIR/seed-cognito.sh" local || echo "  ⚠ Cognito seed step skipped/failed"
 echo ""
 
 # ============================================================
-# STEP 5: Check and Start Frontend
+# STEP 4: CORS proxy
 # ============================================================
-echo -e "[5/5] Checking Frontend..."
-
-# Check if npm is installed
-if ! command -v npm &> /dev/null; then
-    echo -e "ERROR: npm is not installed"
-    exit 1
-fi
-
-# Change to frontend directory
+echo "[4/5] Starting CORS proxy on :3001..."
 cd "$FRONTEND_DIR"
 
-# Check if dependencies are installed
-if [ ! -d "node_modules" ]; then
-    echo -e "  ⚠ Frontend dependencies not installed, installing..."
+"$SCRIPT_DIR/generate-env.sh" >/dev/null 2>&1 || echo "  ⚠ Could not generate .env.local"
+
+if [ -f /tmp/proxy-server.pid ]; then
+    kill "$(cat /tmp/proxy-server.pid)" 2>/dev/null || true
+    rm -f /tmp/proxy-server.pid
+fi
+# Belt-and-braces: kill anything still bound to :3001 even when the pid file
+# is stale (e.g. a previous run was started outside this script). Without
+# this the next nohup fails with EADDRINUSE.
+if lsof -iTCP:3001 -sTCP:LISTEN >/dev/null 2>&1; then
+    lsof -ti:3001 | xargs -r kill -9 2>/dev/null || true
+    sleep 1
+fi
+
+nohup node "$SCRIPT_DIR/proxy-server.js" >/tmp/proxy-server.log 2>&1 &
+PROXY_PID=$!
+sleep 2
+if kill -0 "$PROXY_PID" 2>/dev/null; then
+    echo "  ✓ Proxy server started (PID: $PROXY_PID)"
+    echo "$PROXY_PID" > /tmp/proxy-server.pid
+else
+    echo "  ✗ Proxy server failed to start"
+    if [ -s /tmp/proxy-server.log ]; then
+        cat /tmp/proxy-server.log | sed 's/^/    /'
+    else
+        echo "    (no output captured — usually means 'node' could not be executed)"
+        echo "    node: $(command -v node 2>/dev/null || echo 'NOT FOUND')"
+    fi
+    exit 1
+fi
+echo ""
+
+# ============================================================
+# STEP 5: Frontend (Vite)
+# ============================================================
+echo "[5/5] Starting Vite dev server on :3000..."
+
+command -v npm >/dev/null 2>&1 || { echo "ERROR: npm is not installed"; exit 1; }
+
+if [ ! -d node_modules ]; then
+    echo "  Installing frontend dependencies..."
     rm -f package-lock.json
-    npm install > /tmp/npm-install.log 2>&1 || {
-        echo -e "  ✗ npm install failed"
+    npm install >/tmp/npm-install.log 2>&1 || {
+        echo "  ✗ npm install failed"
         tail -n 30 /tmp/npm-install.log | sed 's/^/    /'
         exit 1
     }
-    echo -e "  ✓ Frontend dependencies installed"
-else
-    echo -e "  ✓ Frontend dependencies already installed"
-fi
-
-# Generate .env.local for frontend
-echo -e "  Generating frontend environment configuration..."
-"$SCRIPT_DIR/generate-env.sh" > /dev/null 2>&1 || {
-    echo -e "  ⚠ Could not generate .env.local"
-}
-
-# Restart proxy so it picks up the newly generated .env.local
-if [ -f /tmp/proxy-server.pid ]; then
-    kill "$(cat /tmp/proxy-server.pid)" || echo "WARNING: no process found"
-    rm -f /tmp/proxy-server.pid
-elif lsof -iTCP:3001 -sTCP:LISTEN > /dev/null 2>&1; then
-    lsof -ti:3001 | xargs kill 2>/dev/null
-fi
-
-echo -e "  Starting CORS proxy server..."
-nohup node "$SCRIPT_DIR/proxy-server.js" > /tmp/proxy-server.log 2>&1 &
-PROXY_PID=$!
-
-# Wait for proxy to start
-sleep 2
-
-# Verify proxy started
-if kill -0 $PROXY_PID 2>/dev/null; then
-    echo -e "  ✓ Proxy server started (PID: $PROXY_PID)"
-    echo $PROXY_PID > /tmp/proxy-server.pid
-else
-    echo -e "  ✗ Proxy server failed to start"
-    cat /tmp/proxy-server.log | sed 's/^/    /'
-    exit 1
-fi
-
-# Check if React dev server is already running
-REACT_RUNNING=false
-if lsof -iTCP:3000 -sTCP:LISTEN > /dev/null 2>&1 || ss -ltn 2>/dev/null | grep -q ':3000'; then
-    REACT_RUNNING=true
-    echo -e "  ✓ React dev server is already running on port 3000"
 fi
 
 echo ""
 echo "============================================================"
-echo -e "  ✓ All Components Verified!"
+echo "  All services up"
 echo "============================================================"
+echo "  • postgres   → localhost:5432  (docker: workshop-postgres)"
+echo "  • localstack → localhost:4566  (docker: workshop-localstack)"
+echo "  • proxy      → http://localhost:3001"
+echo "  • frontend   → http://localhost:3000"
 echo ""
-echo "Services Status:"
-echo "  • MongoDB:    Running on 0.0.0.0:27017"
-echo "  • PostgreSQL: Running on localhost:5432"
-echo "  • LocalStack: Running on localhost:4566"
-echo "  • Backend:    Deployed to LocalStack"
-echo "  • Proxy:      Running on localhost:3001"
-if [ "$REACT_RUNNING" = true ]; then
-    echo "  • Frontend:   Already running on localhost:3000"
-else
-    echo "  • Frontend:   Ready to start"
-fi
+echo "  Stop the stack with:   docker compose down"
+echo "  Press Ctrl+C to stop the Vite dev server."
 echo ""
 
-if [ "$REACT_RUNNING" = true ]; then
-    echo "All services are running!"
-    echo "  Frontend: http://localhost:3000"
-    echo "  Backend:  http://localhost:3001"
-else
-    echo "Starting React development server..."
-    echo "  Frontend: http://localhost:3000"
-    echo "  Backend:  http://localhost:3001"
-    echo ""
-    echo "Press Ctrl+C to stop"
-    echo ""
+trap 'kill "$(cat /tmp/proxy-server.pid 2>/dev/null)" 2>/dev/null || true; rm -f /tmp/proxy-server.pid' EXIT
 
-    # Cleanup: Kill proxy server when script exits
-    if [ -f /tmp/proxy-server.pid ]; then
-        PROXY_PID=$(cat /tmp/proxy-server.pid)
-        trap "kill $PROXY_PID 2>/dev/null; rm -f /tmp/proxy-server.pid" EXIT
-    fi
+npm run dev
 
-    # Start React development server
-    npm run dev
-fi
+

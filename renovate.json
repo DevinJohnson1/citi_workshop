@@ -1,0 +1,59 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    ":disableDependencyDashboard"
+  ],
+  "labels": ["dependencies"],
+  "rebaseWhen": "conflicted",
+  "dependencyDashboard": false,
+  "prHourlyLimit": 0,
+  "prConcurrentLimit": 0,
+
+  "//": [
+    "Policy: only open PRs when a known vulnerability of HIGH or CRITICAL",
+    "severity is patched in one of our dependencies. Routine version bumps,",
+    "lockfile maintenance, etc. are all suppressed. See SYSTEM_DESIGN §9."
+  ],
+
+  "packageRules": [
+    {
+      "description": "Suppress all routine (non-vulnerability) updates.",
+      "matchPackageNames": ["*"],
+      "enabled": false
+    }
+  ],
+
+  "vulnerabilityAlerts": {
+    "enabled": true,
+    "labels": ["security", "vulnerability"],
+    "assignees": [],
+    "reviewers": [],
+    "schedule": ["at any time"],
+    "minimumReleaseAge": "0 days",
+    "//": [
+      "vulnerabilityAlerts overrides the global disable above. Inside this",
+      "block we re-disable LOW/MODERATE so only HIGH/CRITICAL fixes ship.",
+      "Requires Renovate >= 37 for matchVulnerabilitySeverity."
+    ],
+    "packageRules": [
+      {
+        "description": "Re-enable severity-gated security fixes.",
+        "matchPackageNames": ["*"],
+        "matchVulnerabilitySeverity": ["HIGH", "CRITICAL"],
+        "enabled": true
+      },
+      {
+        "description": "Drop low/moderate noise.",
+        "matchPackageNames": ["*"],
+        "matchVulnerabilitySeverity": ["LOW", "MODERATE"],
+        "enabled": false
+      }
+    ]
+  },
+
+  "osvVulnerabilityAlerts": true,
+
+  "lockFileMaintenance": { "enabled": false }
+}
+

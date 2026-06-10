@@ -48,9 +48,50 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // Parse request path: /api/{endpoint_name}
+  // Parse request path: /api/{endpoint_name}  OR  /cognito
   const parsedUrl = url.parse(req.url);
   const pathParts = parsedUrl.pathname.split('/').filter(Boolean);
+
+  // ----- Cognito proxy --------------------------------------------------
+  // LocalStack only routes cognito-idp requests when the Host header is the
+  // regional subdomain (cognito-idp.us-east-1.localhost.localstack.cloud) AND
+  // returns no CORS headers on the OPTIONS preflight — so we cannot call it
+  // straight from the browser. The frontend POSTs InitiateAuth bodies here
+  // and we forward them server-side with the right Host + X-Amz-Target.
+  if (pathParts[0] === 'cognito') {
+    const cognitoHost = process.env.COGNITO_HOST
+      || 'cognito-idp.us-east-1.localhost.localstack.cloud';
+    const cognitoPort = process.env.COGNITO_PORT || '4566';
+    const target = {
+      hostname: cognitoHost,
+      port: cognitoPort,
+      path: '/',
+      method: req.method,
+      headers: {
+        'content-type': req.headers['content-type'] || 'application/x-amz-json-1.1',
+        'x-amz-target': req.headers['x-amz-target'] || '',
+        'host': `${cognitoHost}:${cognitoPort}`,
+      },
+    };
+    console.log(`${req.method} /cognito (${req.headers['x-amz-target']}) -> http://${cognitoHost}:${cognitoPort}/`);
+    const proxyReq = http.request(target, (proxyRes) => {
+      const headers = { ...proxyRes.headers };
+      delete headers['access-control-allow-origin'];
+      delete headers['access-control-allow-methods'];
+      delete headers['access-control-allow-headers'];
+      delete headers['access-control-max-age'];
+      res.writeHead(proxyRes.statusCode, headers);
+      proxyRes.pipe(res);
+    });
+    proxyReq.on('error', (err) => {
+      console.error('Cognito proxy error:', err.message);
+      res.writeHead(502, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Bad Gateway', message: err.message }));
+    });
+    req.pipe(proxyReq);
+    return;
+  }
+  // ---------------------------------------------------------------------
 
   if (pathParts[0] !== 'api' || pathParts.length < 2) {
     res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -91,7 +132,9 @@ const server = http.createServer((req, res) => {
   delete headers['sec-fetch-mode'];
   delete headers['sec-fetch-dest'];
 
-  // Keep only essential headers
+  // Keep only essential headers. Authorization MUST be forwarded so the
+  // Lambda's JWT verifier (backend/_lib/auth.py) can validate the Cognito
+  // access token issued by the workshop login form.
   const options = {
     hostname: target.hostname,
     port: target.port,
@@ -101,9 +144,12 @@ const server = http.createServer((req, res) => {
       'accept': headers.accept || 'application/json',
       'content-type': headers['content-type'] || 'application/json',
       'user-agent': headers['user-agent'] || 'proxy-server',
-      'host': target.host
-    }
+      'host': target.host,
+    },
   };
+  if (headers.authorization) {
+    options.headers.authorization = headers.authorization;
+  }
 
   const proxyReq = protocol.request(options, (proxyRes) => {
     // Filter out CORS headers from Lambda response since we set our own

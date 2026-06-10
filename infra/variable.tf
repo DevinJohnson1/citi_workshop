@@ -34,14 +34,14 @@ variable "aws_postgres_host" {
   default     = null
 }
 
-variable "aws_mongo_enabled" {
-  description = "Enable or disable MongoDB (AWS DocumentDB). Default: false (set to 'true' to enable it)."
-  type        = bool
-  default     = false
+variable "cloudfront_domain" {
+  description = "Optional CloudFront domain (e.g. d123abc.cloudfront.net) to register as a Cognito callback/logout URL. Leave empty on the first apply, then rerun with `-var cloudfront_domain=$(terraform output -raw cloudfront_distribution_url)` to add it. Kept as a var to avoid a Lambda/Cognito/CloudFront graph cycle."
+  type        = string
+  default     = ""
 }
 
-variable "aws_mongo_host" {
-  description = "MongoDB host for LocalStack. Default: 'host.docker.internal' (set to '172.17.0.1' on Linux)."
-  type        = string
-  default     = null
+variable "enable_cognito" {
+  description = "Force-enable Cognito resources even on LocalStack (account id 000000000000). Default true — assumes LocalStack Pro locally. Set false only when running LocalStack Community, in which case Cognito resources are skipped and Lambdas will reject every request (no dev-user fallback)."
+  type        = bool
+  default     = true
 }

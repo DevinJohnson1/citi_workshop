@@ -212,6 +212,7 @@ yarn-error.log*
 .env
 .env.*
 !.env.sample
+!.env.example
 ENVIRONMENT.config
 
 # Logs
@@ -256,3 +257,6 @@ tfplan
 
 # Snyk Security Extension - AI Rules (auto-generated)
 .github/instructions/snyk_rules.instructions.md
+
+# Copied shared library inside each Lambda service (created by bin/deploy-backend.sh).
+backend/*/_lib/

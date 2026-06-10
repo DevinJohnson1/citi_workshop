@@ -65,3 +65,13 @@ fi
 cd $INFRA_DIR
 terraform init -reconfigure -backend-config="bucket=$AWS_S3_BUCKET"
 terraform destroy -auto-approve
+
+# Tear down the local docker stack too (Postgres + LocalStack containers and
+# their volumes). Safe to run even if compose was never started.
+if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+    echo ""
+    echo "INFO: Stopping local docker stack (postgres + localstack)..."
+    cd "$PROJECT_ROOT"
+    docker compose down --volumes --remove-orphans 2>/dev/null || true
+fi
+

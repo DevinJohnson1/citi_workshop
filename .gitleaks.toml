@@ -1,0 +1,26 @@
+# Gitleaks configuration. Extends the upstream default ruleset and adds a
+# small allow-list for placeholder values committed to the repo on purpose
+# (sample env files, LocalStack credentials, Terraform state-bucket name).
+#
+# Re-running locally:
+#   docker run --rm -v "$PWD:/repo" zricethezav/gitleaks:latest detect \
+#       --source=/repo --config=/repo/.gitleaks.toml
+[extend]
+useDefault = true
+[allowlist]
+description = "Workshop placeholders and LocalStack dummies"
+paths = [
+    '''(?i)frontend/\.env\.sample$''',
+    '''(?i)README\.md$''',
+    '''(?i)SYSTEM_DESIGN\.md$''',
+    '''(?i)docs/.*''',
+]
+regexes = [
+    # LocalStack ships a fixed dummy access key in every example. Never a real secret.
+    '''AKIA[0-9A-Z]{0,4}EXAMPLE''',
+    '''(?i)test[_-]?access[_-]?key''',
+    # Workshop default Postgres password used only against LocalStack.
+    '''postgres123''',
+    # Terraform state bucket placeholder used in the default provider config.
+    '''coding-workshop-(tfstate-)?[a-z0-9-]*abcd1234''',
+]

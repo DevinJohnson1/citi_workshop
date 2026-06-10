@@ -1,272 +1,52 @@
-# Coding Workshop - Deployment Scripts
-
-## Overview
-
-This directory contains development and deployment scripts that can be used with local development and cloud deployment.
-
-## Quick Start
-
-### Local Development
-
-To run your application locally:
-
-```sh
-./bin/start-dev.sh
-```
-
-### Cloud Deployment
-
-To deploy your backend to AWS:
-
-```sh
-./bin/deploy-backend.sh
-```
-
-To deploy your frontend to AWS:
-
-```sh
-./bin/deploy-frontend.sh
-```
-
-## Available Scripts
-
-### `deploy-backend.sh`
-
-**The main deployment script** - deploys complete infrastructure including backend Lambda functions.
-
-**What it does**:
-
-* Creates VPC, security groups, and networking
-* Deploys all Lambda functions with Function URLs
-* Sets up S3 bucket for frontend hosting
-* Creates CloudFront distribution with routing (AWS only)
-* Sets up DocumentDB cluster
-* Auto-detects environment (LocalStack vs AWS)
-* Loads participant credentials for multi-participant workshops
-
-**When to use**:
-
-* Initial deployment
-* After changing Lambda function code
-* After adding new Lambda functions (auto-discovered!)
-* After infrastructure changes
-
-**Key feature**: Terraform only updates changed resources, so running this after Lambda code changes is fast (~5-10 seconds).
-
-**Usage**:
-
-```sh
-./bin/deploy-backend.sh [aws|local]
-```
-
-### `deploy-frontend.sh`
-
-Builds and deploys the React frontend to AWS.
-
-**What it does**:
-
-* LocalStack: Displays message to use `npm run dev` (skips S3 deployment)
-* AWS:
-  * Loads participant environment credentials
-  * Runs `npm run build` to create production build
-  * Uploads static files to S3 bucket
-  * Invalidates CloudFront cache
-  * Displays CloudFront URL
-
-**When to use**:
-
-* LocalStack: Don't use this - use `./bin/start-dev.sh` for hot-reload instead
-* AWS only: After making changes to React components
-
-**Why skip LocalStack S3?** The dev server (`npm run dev`) provides instant hot-reload (1-2 seconds) vs full build+deploy (~30-60 seconds).
-
-**Usage**:
-
-```sh
-./bin/deploy-frontend.sh [aws|local]
-```
-
-### `start-dev.sh`
-
-Starts the complete development environment with hot-reload.
-
-**What it does**:
-
-* Checks LocalStack is running
-* Verifies backend is deployed
-* Generates `.env.local` for frontend
-* Starts proxy server on port 3001 (CORS workaround)
-* Starts React dev server on port 3000 (hot-reload)
-
-**When to use**:
-
-* LocalStack development (recommended workflow)
-* Frontend development with backend integration
-* Testing full stack locally
-
-**Usage**:
-
-```sh
-./bin/start-dev.sh
-```
-
-### `generate-env.sh`
-
-Generates `.env.local` file for React frontend.
-
-**What it does**:
-
-* Detects LocalStack vs AWS environment
-* Reads Terraform outputs (API URLs, endpoints)
-* Generates frontend environment configuration
-* LocalStack: Sets proxy URL (`http://localhost:3001`)
-* AWS: Sets CloudFront URL
-
-**When to use**:
-
-* After deploying backend
-* After adding new Lambda functions
-* When switching between LocalStack and AWS
-
-**Usage**:
-
-```sh
-./bin/generate-env.sh
-```
-
-### `proxy-server.js`
-
-Development CORS proxy server for LocalStack.
-
-**What it does**:
-
-* Listens on port 3001
-* Forwards `/api/*` requests to LocalStack Lambda URLs
-* Strips browser headers that trigger LocalStack CORS bug
-* Adds proper CORS headers to responses
-
-**Why needed**: LocalStack Lambda Function URLs have a CORS bug.
-
-**Usage** (automatically started by `start-dev.sh`):
-
-```sh
-node ./bin/proxy-server.js
-```
-
-### `setup-participant.sh`
-
-**One-time setup for multi-participant AWS workshops** - configures participant credentials automatically.
-
-**What it does**:
-
-* Auto-detects AWS Account ID from your credentials
-* Constructs IAM role ARN: `arn:aws:iam::{ACCOUNT}:role/coding-workshop-{PARTICIPANT_ID}`
-* Constructs S3 backend bucket: `coding-workshop-tfstate-{PARTICIPANT_ID}`
-* Creates AWS CLI profile: `coding-workshop-{PARTICIPANT_ID}`
-* Generates Terraform backend config: `BACKEND.config`
-* Creates environment file: `ENVIRONMENT.config` (auto-loaded by `deploy-backend.sh`)
-
-**When to use**:
-
-* Required: Before your first AWS deployment in multi-participant workshops
-* Not needed: For LocalStack development (no participant isolation required)
-
-**What you need**: Just 2 things from instructor:
-
-1. Participant ID (e.g., `efgh5678`)
-2. Participant Code (e.g., `xK9mP2nR4vT8wQ`)
-
-Everything else (AWS Account ID, S3 bucket name, IAM role) is **automatically detected/derived**.
-
-**Usage**:
-
-```sh
-# 1. First, set up environment variables
-echo 'export EVENT_ID=your-id' >> ~/.bashrc
-echo 'export PARTICIPANT_ID=your-id' >> ~/.bashrc
-echo 'export PARTICIPANT_CODE=your-code' >> ~/.bashrc
-source ~/.bashrc
-
-# 2. Then, run the setup participant script
+# bin/
+Workflow scripts. Always invoke from the repo root (`./bin/<script>.sh`).
+| Script                  | Purpose                                                              |
+| ----------------------- | -------------------------------------------------------------------- |
+| `setup-environment.sh`  | One-time host install: Docker, AWS CLI, Terraform, LocalStack CLI. Pre-pulls the `postgres:17` and `localstack/localstack` docker images. **No native Postgres, no host `psql`, no LocalStack systemd unit** — Postgres and LocalStack run in containers (see `docker-compose.yml`), and `psql` is executed inside those containers by `migrate.sh`. |
+| `setup-participant.sh`  | One-time AWS setup: account/role config + Terraform state bucket.    |
+| `deploy-backend.sh [aws\|local]` | Rsyncs `backend/_lib/` into every service, then `terraform init` + `apply`. For `local`, points Terraform at LocalStack via `AWS_ENDPOINT_URL`. |
+| `migrate.sh [aws\|local]`        | Applies every `backend/_db/migrations/*.sql` in lexical order. Runs `psql` **inside a container** (`docker compose exec postgres` for `local`, ephemeral `docker run --rm postgres:17` for `aws`), so the host needs no `psql` binary. Idempotent. |
+| `deploy-frontend.sh [aws\|local]`| AWS: `npm run build` -> `s3 sync` -> CloudFront invalidation. Local: no-op.|
+| `start-dev.sh`          | `docker compose up -d postgres localstack` (waits for health) -> `migrate.sh local` -> `deploy-backend.sh local` -> CORS proxy on :3001 -> Vite on :3000. |
+| `generate-env.sh`       | Reads Terraform outputs and writes `frontend/.env.local` (API + Cognito vars).|
+| `proxy-server.js`       | Node proxy that fans `/api/<svc>*` to Lambda Function URLs locally (works around a LocalStack CORS bug). |
+| `cleanup-environment.sh`| `terraform destroy` followed by `docker compose down --volumes`.     |
+## Typical sequences
+```bash
+# Local development — one command does everything
+./bin/setup-environment.sh        # once per machine
+./bin/start-dev.sh                # every session
+
+# Or the manual breakdown
+docker compose up -d postgres localstack
+./bin/migrate.sh local
+./bin/deploy-backend.sh local
+(cd frontend && npm run dev)
+
+# AWS workshop
 ./bin/setup-participant.sh
+./bin/deploy-backend.sh aws
+./bin/migrate.sh aws
+./bin/deploy-frontend.sh aws
 ```
+## Notes
+- Postgres and LocalStack run as docker containers (`workshop-postgres`,
+  `workshop-localstack`) on a shared user-defined network `coding-workshop`.
+  LocalStack is configured with `LAMBDA_DOCKER_NETWORK=coding-workshop` so the
+  Lambda containers it spawns reach Postgres by service name (`postgres:5432`).
+- All scripts use `set -e`. If one fails, fix the root cause and re-run; they
+  are designed to be idempotent.
+- `migrate.sh aws` reads `rds_endpoint`/`rds_password` from Terraform outputs,
+  so `deploy-backend.sh aws` must succeed first.
+- `deploy-backend.sh` copies `backend/_lib/` into each `backend/<svc>/_lib/`
+  before `terraform apply`. Those copies are gitignored.
+- Override the dockerized Postgres credentials with `POSTGRES_USER` /
+  `POSTGRES_PASS` / `POSTGRES_NAME`. Easiest way: `cp .env.example .env` and
+  edit. Compose auto-loads `.env`; `start-dev.sh` seeds it from the example on
+  first run.
+- Ad-hoc queries: `docker compose exec postgres psql -U postgres` (no host
+  `psql` install needed; the `postgres:17` image bundles the client).
 
-### `setup-environment.sh`
 
-Sets up the complete local development environment on Ubuntu 22.04.
 
-**What it does**:
 
-* Installs Docker (Container runtime)
-* Installs LocalStack (AWS service emulation)
-* Installs AWS CLI v2 (AWS command-line tools)
-* Installs Terraform (Infrastructure as Code)
-* Installs PostgreSQL (Relational database)
-* Installs MongoDB (NoSQL database)
-* Optionally: Installs and configures dnsmasq (DNS resolution)
-
-**When to use**:
-
-* Initial machine setup for Ubuntu 22.04
-* First-time local development environment installation
-* One-time per developer machine
-
-**Prerequisites**:
-
-* Ubuntu 22.04 Desktop
-* Administrator/sudo access
-* Internet connection for package downloads
-
-**Usage**:
-
-```sh
-# Basic setup (without dnsmasq)
-./bin/setup-environment.sh
-
-# With dnsmasq DNS configuration
-./bin/setup-environment.sh -d
-
-# Dry run (show what would be done without making changes)
-./bin/setup-environment.sh -n
-
-# Both dnsmasq and dry run
-./bin/setup-environment.sh -d -n
-```
-
-**Notes**:
-
-* Script auto-detects if dependencies are already installed and skips redundant steps
-* Continues on non-critical errors and reports all issues at the end
-* Dry run mode (`-n`) shows planned actions without making changes
-* dnsmasq (`-d`) is optional - enables DNS resolution for `.local` domains
-
-### `cleanup-environment.sh`
-
-Destroys all infrastructure resources created by the deployment scripts.
-
-**What it does**:
-
-* Removes all AWS/LocalStack resources (VPC, Lambda, S3, CloudFront, DocumentDB, etc.)
-* Uses Terraform to cleanly destroy infrastructure
-* Verifies Terraform is installed before proceeding
-
-**When to use**:
-
-* End of workshop to clean up resources
-* Before redeploying from scratch
-* To avoid unnecessary AWS charges
-* When resetting the environment
-
-**Warning**: This action **cannot be undone**. All data and resources will be permanently deleted.
-
-**Prerequisites**:
-
-* Terraform must be installed
-* Valid AWS credentials configured (for AWS deployments)
-* LocalStack running (for LocalStack deployments)
-
-**Usage**:
-
-```sh
-./bin/cleanup-environment.sh
-```

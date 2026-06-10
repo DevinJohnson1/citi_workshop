@@ -99,17 +99,47 @@ fi
 API_ENDPOINTS=$(terraform output -json api_endpoints 2>/dev/null || echo "{}")
 LAMBDA_URLS=$(terraform output -json lambda_urls 2>/dev/null || echo "{}")
 
+# Cognito outputs. With var.enable_cognito=true these are populated on
+# LocalStack Pro too. The frontend uses VITE_COGNITO_ENDPOINT to call
+# cognito-idp's InitiateAuth directly (USER_PASSWORD_AUTH) from the login form;
+# the AWS region in VITE_COGNITO_REGION is used to sign that request.
+COGNITO_CLIENT_ID=$(terraform output -raw cognito_client_id 2>/dev/null || echo "")
+COGNITO_ISSUER_URL=$(terraform output -raw cognito_issuer_url 2>/dev/null || echo "")
+COGNITO_DOMAIN=$(terraform output -raw cognito_domain 2>/dev/null || echo "")
+
+if [ "$ENVIRONMENT" = "aws" ]; then
+    VITE_COGNITO_ENDPOINT="https://cognito-idp.${AWS_REGION:-us-east-1}.amazonaws.com"
+else
+    # Browser → CORS proxy (/cognito) → cognito-idp regional subdomain. The
+    # browser cannot call cognito-idp directly on LocalStack because the
+    # OPTIONS preflight returns 403 with no CORS headers.
+    VITE_COGNITO_ENDPOINT="http://localhost:3001/cognito"
+fi
+VITE_COGNITO_REGION="${AWS_REGION:-us-east-1}"
+
+# Frontend base URL: '/api' when CloudFront fronts it, proxy on localhost otherwise.
+if [ "$ENVIRONMENT" = "aws" ]; then
+    VITE_API_BASE_URL="/api"
+    VITE_REDIRECT_URI="${API_BASE_URL%/}/login/callback"
+else
+    VITE_API_BASE_URL="http://localhost:3001/api"
+    VITE_REDIRECT_URI="http://localhost:3000/login/callback"
+fi
+
 # Generate .env.local configuration file for React frontend
 cat > "$ENVIRONMENT_CONFIG" << EOF
 # Auto-generated environment file
 # Generated on: $(date)
 # Environment: $ENVIRONMENT
-REACT_APP_API_URL=$API_BASE_URL
-REACT_APP_API_ENDPOINTS='$API_ENDPOINTS'
-REACT_APP_LAMBDA_URLS='$LAMBDA_URLS'
-VITE_API_URL=$API_BASE_URL
+VITE_API_BASE_URL=$VITE_API_BASE_URL
 VITE_API_ENDPOINTS='$API_ENDPOINTS'
 VITE_LAMBDA_URLS='$LAMBDA_URLS'
+VITE_COGNITO_AUTHORITY=$COGNITO_ISSUER_URL
+VITE_COGNITO_CLIENT_ID=$COGNITO_CLIENT_ID
+VITE_COGNITO_DOMAIN=$COGNITO_DOMAIN
+VITE_COGNITO_REDIRECT_URI=$VITE_REDIRECT_URI
+VITE_COGNITO_ENDPOINT=$VITE_COGNITO_ENDPOINT
+VITE_COGNITO_REGION=$VITE_COGNITO_REGION
 EOF
 
 echo ""

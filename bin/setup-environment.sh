@@ -743,86 +743,18 @@ install_awscli() {
 # SECTION 10: DATABASE TOOLS
 # ============================================================================
 
-install_postgres() {
-    local version="$1"
-    local display_name="PostgreSQL $version"
-
-    print_section "$display_name"
-
-    if is_dry_run; then
-        print_dry_run_header "POSTGRES" "$display_name"
-        if command -v psql &> /dev/null && psql --version 2>/dev/null | grep -q "psql.*$version"; then
-            print_dry_run_status "Already installed: $(psql --version 2>/dev/null)"
-        else
-            print_dry_run_missing "Not installed"
-            print_dry_run_action "Would add PostgreSQL APT repository GPG key"
-            print_dry_run_action "Would add PostgreSQL ${version} APT repository"
-            print_dry_run_action "Would install: postgresql-${version} postgresql-client-${version}"
-        fi
-        print_dry_run_action "Would enable: postgresql.service"
-        return
-    fi
-
-    print_info "Installing $display_name..."
-
-    # Idempotency check
-    if command -v psql &> /dev/null && psql --version 2>/dev/null | grep -q "psql.*$version"; then
-        print_info "$display_name already installed: $(psql --version)"
-
-        # Ensure service is running
-        if ! sudo systemctl is-active --quiet postgresql; then
-            print_info "Starting PostgreSQL service..."
-            sudo systemctl start postgresql && sudo systemctl enable postgresql
-        fi
-        return
-    fi
-
-    # Add PostgreSQL APT repository GPG key
-    if curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | \
-       sudo gpg --dearmor -o /usr/share/keyrings/postgresql-keyring.gpg; then
-
-        # Add repository
-        echo "deb [arch=amd64 signed-by=/usr/share/keyrings/postgresql-keyring.gpg] http://apt.postgresql.org/pub/repos/apt jammy-pgdg main" | \
-            sudo tee /etc/apt/sources.list.d/pgdg.list > /dev/null
-
-        # Install
-        if sudo apt update && sudo apt install -y "postgresql-${version}" "postgresql-client-${version}"; then
-            print_status "$display_name installed: $(psql --version)"
-
-            # Start and enable service
-            if sudo systemctl start postgresql && sudo systemctl enable postgresql; then
-                print_status "PostgreSQL service started and enabled"
-                print_info "PostgreSQL is accessible at: localhost:5432"
-            else
-                add_failure "Failed to start/enable PostgreSQL service"
-            fi
-        else
-            add_failure "Failed to install $display_name"
-        fi
-    else
-        add_failure "Failed to add PostgreSQL APT repository GPG key"
-    fi
+install_postgres_client() {
+    # Intentionally omitted. The Postgres SERVER runs in Docker (see
+    # docker-compose.yml) and bin/migrate.sh routes psql through
+    # `docker compose exec postgres` (local) or `docker run --rm postgres:17`
+    # (aws), so the host needs no postgresql-client package. This function is
+    # retained as a stub so older call sites fail loudly if someone re-adds it.
+    print_section "PostgreSQL client (skipped — runs in Docker)"
+    print_info "Host psql install removed. Run queries with:"
+    print_info "  docker compose exec postgres psql -U postgres"
+    print_info "Migrations: ./bin/migrate.sh [local|aws]"
 }
 
-configure_postgres_auth() {
-    print_section "PostgreSQL Authentication"
-
-    if is_dry_run; then
-        print_dry_run_header "POSTGRES-AUTH" "PostgreSQL Authentication"
-        print_dry_run_action "Would set password for PostgreSQL user: ${POSTGRES_USER}"
-        return
-    fi
-
-    print_info "Configuring PostgreSQL authentication..."
-
-    # Set password for the postgres superuser via psql as the postgres system user
-    if sudo -u postgres psql -c "ALTER USER ${POSTGRES_USER} WITH PASSWORD '${POSTGRES_PASS}';" 2>/dev/null; then
-        print_status "PostgreSQL password set for user '${POSTGRES_USER}'"
-        print_info "Connect with: psql -U ${POSTGRES_USER} -h localhost -W"
-    else
-        add_failure "Failed to set PostgreSQL password for user '${POSTGRES_USER}'"
-    fi
-}
 
 install_pgadmin() {
     print_section "pgAdmin"
@@ -1185,23 +1117,26 @@ install_python() {
 install_localstack() {
     print_section "LocalStack CLI"
 
+    # NOTE: the LocalStack stack itself runs in Docker, managed by
+    # docker-compose.yml at the repo root. This step only installs the
+    # `localstack` CLI binary, which is handy for `localstack logs`,
+    # `localstack state inspect`, etc. The CLI is OPTIONAL — `docker compose
+    # up -d localstack` is the authoritative way to start the service.
+
     if is_dry_run; then
         print_dry_run_header "LOCALSTACK" "LocalStack CLI"
         if command -v localstack &> /dev/null; then
             print_dry_run_status "Already installed: $(localstack --version 2>/dev/null)"
         else
             print_dry_run_missing "Not installed"
-            print_dry_run_action "Would download: v${LOCALSTACK_VERSION}"
-            print_dry_run_action "Would install to: /usr/local/bin/localstack"
+            print_dry_run_action "Would install: localstack==${LOCALSTACK_VERSION} (pip)"
         fi
-        print_dry_run_action "Would create: /etc/systemd/system/localstack.service"
-        print_dry_run_action "Would enable: localstack.service"
+        print_dry_run_action "Would pre-pull docker images: postgres:17, localstack/localstack:latest"
         return
     fi
 
-    print_info "Installing LocalStack CLI..."
+    print_info "Installing LocalStack CLI (optional helper — stack runs in Docker)..."
 
-    # Idempotency check
     if command -v localstack &> /dev/null; then
         print_info "LocalStack already installed: $(localstack --version)"
     else
@@ -1212,7 +1147,6 @@ install_localstack() {
         if python3 -m pip install localstack==$LOCALSTACK_VERSION; then
             print_status "LocalStack CLI installed: $(localstack --version)"
 
-            # Add ~/.local/bin to PATH if not already there
             if [[ ":$PATH:" != *":$ACTUAL_HOME/.local/bin:"* ]]; then
                 echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$ACTUAL_HOME/.bashrc"
                 export PATH="$ACTUAL_HOME/.local/bin:$PATH"
@@ -1223,53 +1157,26 @@ install_localstack() {
         fi
     fi
 
-    # Configure LocalStack systemd service
-    configure_localstack_service
+    pull_docker_images
 }
 
-configure_localstack_service() {
-    print_info "Configuring LocalStack systemd service..."
+pull_docker_images() {
+    print_info "Pre-pulling Docker images used by bin/start-dev.sh..."
 
-    if sudo tee /etc/systemd/system/localstack.service > /dev/null <<EOF
-[Unit]
-Description=LocalStack - Local AWS Cloud Stack
-After=docker.service
-Requires=docker.service
-
-[Service]
-Type=simple
-User=$ACTUAL_USER
-Group=docker
-Environment="PATH=$ACTUAL_HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
-Environment="HOME=$ACTUAL_HOME"
-ExecStart=$ACTUAL_HOME/.local/bin/localstack start
-ExecStop=$ACTUAL_HOME/.local/bin/localstack stop
-Restart=on-failure
-RestartSec=10
-
-[Install]
-WantedBy=multi-user.target
-EOF
-    then
-        if ! sudo systemctl daemon-reload; then
-            add_failure "Failed to reload systemd daemon"
-            return
-        fi
-
-        if ! sudo systemctl enable localstack.service; then
-            add_failure "Failed to enable LocalStack service"
-            return
-        fi
-
-        if ! sudo systemctl start localstack.service; then
-            add_failure "Failed to start LocalStack service"
-            return
-        fi
-
-        print_status "LocalStack service started and enabled (starts on boot)"
-    else
-        add_failure "Failed to create LocalStack systemd service"
+    if ! command -v docker &> /dev/null || ! docker info &>/dev/null; then
+        print_info "Docker not available yet — skipping image pre-pull (start-dev.sh will pull on first run)"
+        return
     fi
+
+    for image in "postgres:17" "localstack/localstack:latest"; do
+        if docker image inspect "$image" &>/dev/null; then
+            print_info "$image already pulled"
+        elif docker pull "$image" >/dev/null 2>&1; then
+            print_status "Pulled $image"
+        else
+            add_failure "Failed to pull $image"
+        fi
+    done
 }
 
 # ============================================================================
@@ -1415,7 +1322,6 @@ run_verification() {
     verify_tool "LocalStack" "localstack --version"
 
     # Database
-    verify_tool "PostgreSQL" "psql --version"
     verify_tool "PostgreSQL pgAdmin" "pgAdmin"
     verify_tool "MongoDB" "mongod --version" "grep 'db version'"
     verify_dpkg "MongoDB Compass" "mongodb-compass"
@@ -1442,10 +1348,22 @@ run_verification() {
 
     verify_service "docker"
     verify_service "mongod"
-    verify_service_enabled "localstack"
+    # NOTE: postgres + localstack no longer run as systemd units — they live in
+    # docker-compose.yml at the repo root. Verified separately below.
 
     if [ "$INSTALL_DNSMASQ" = true ]; then
         verify_service "dnsmasq"
+    fi
+
+    # Docker image presence (the actual services start on `docker compose up`).
+    if command -v docker &> /dev/null; then
+        for image in "postgres:17" "localstack/localstack:latest"; do
+            if docker image inspect "$image" &>/dev/null; then
+                echo -e "  ${GREEN}✓${NC} docker image $image: pulled"
+            else
+                echo -e "  ${YELLOW}○${NC} docker image $image: not pulled (will pull on first docker compose up)"
+            fi
+        done
     fi
 }
 
@@ -1546,8 +1464,14 @@ echo ""
 
 echo "Services:"
 systemctl is-active --quiet docker && echo -e "  ${GREEN}✓${NC} Docker: running" || echo -e "  ${RED}✗${NC} Docker: not running"
-systemctl is-active --quiet mongod && echo -e "  ${GREEN}✓${NC} MongoDB: running" || echo -e "  ${RED}✗${NC} MongoDB: not running"
-curl -s http://localhost:4566/_localstack/health &>/dev/null && echo -e "  ${GREEN}✓${NC} LocalStack: running" || echo -e "  ${YELLOW}○${NC} LocalStack: not running"
+systemctl is-active --quiet mongod && echo -e "  ${GREEN}✓${NC} MongoDB: running" || echo -e "  ${YELLOW}○${NC} MongoDB: not running"
+# Postgres and LocalStack run as docker containers (workshop-postgres / workshop-localstack).
+docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^workshop-postgres$' \
+    && echo -e "  ${GREEN}✓${NC} Postgres (docker): running" \
+    || echo -e "  ${YELLOW}○${NC} Postgres (docker): not running (start with: docker compose up -d postgres)"
+curl -s http://localhost:4566/_localstack/health &>/dev/null \
+    && echo -e "  ${GREEN}✓${NC} LocalStack (docker): running" \
+    || echo -e "  ${YELLOW}○${NC} LocalStack (docker): not running (start with: docker compose up -d localstack)"
 
 echo ""
 echo "Tool Versions:"
@@ -1642,20 +1566,16 @@ print_summary() {
 
     # Connection info
     echo "CONNECTION INFO:"
-    if systemctl is-active --quiet postgresql 2>/dev/null; then
-        echo -e "  ${GREEN}✓${NC} PostgreSQL: postgresql://localhost:5432"
-    else
-        echo -e "  ${RED}✗${NC} PostgreSQL: postgresql://localhost:5432 (not running)"
-    fi
+    echo "  Postgres and LocalStack run in Docker via docker-compose.yml."
+    echo "  Start them with:    docker compose up -d postgres localstack"
+    echo "  Or run the full stack (DB + LocalStack + backend + frontend):"
+    echo "                      ./bin/start-dev.sh"
+    echo ""
+    echo "  Once started, they bind to:"
+    echo "    PostgreSQL: postgresql://postgres:postgres123@localhost:5432/postgres"
+    echo "    LocalStack: http://localhost:4566"
     if systemctl is-active --quiet mongod 2>/dev/null; then
         echo -e "  ${GREEN}✓${NC} MongoDB: mongodb://localhost:27017"
-    else
-        echo -e "  ${RED}✗${NC} MongoDB: mongodb://localhost:27017 (not running)"
-    fi
-    if curl -s http://localhost:4566/_localstack/health &>/dev/null; then
-        echo -e "  ${GREEN}✓${NC} LocalStack: http://localhost:4566"
-    else
-        echo -e "  ${YELLOW}○${NC} LocalStack: http://localhost:4566 (not running)"
     fi
     echo ""
 }
@@ -1723,8 +1643,6 @@ main() {
     install_pycharm
     install_chrome
     install_docker
-    install_postgres "$POSTGRES_VERSION"
-    configure_postgres_auth
     install_pgadmin
     install_mongodb
     configure_mongodb_bind

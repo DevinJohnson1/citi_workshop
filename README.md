@@ -1,113 +1,94 @@
-# Coding Workshop
-
-The goal of this coding workshop is to enable and assess the hands-on skills
-of participants through development of a practical technical solution that
-solves a theoretical business problem.
-
-## Getting Started
-
-Navigate to [Coding Workshop - Main Guide](./docs/README.md) to get started.
-
-## Coding Workshop Example
-
-Coding workshop organizer(s) will provide instructions to follow by email. Here
-below is a real example of requirements and expectations for participant(s):
-
-### Requirements: Business Problem
-
-Our company ACME Inc. is going through a massive organizational transformation
-to become a more data-driven organization. Information about teams structure
-and performance is currently scattered across multiple systems, making it
-difficult to get a comprehensive view of team dynamics and achievements.
-
-We are struggling to answer simple questions like:
-
-* Who are the members of each team?
-* Where are the teams located?
-* What are the key achievements of each team on a monthly basis?
-* How many teams have team leader not co-located with team members?
-* How many teams have team leader as a non-direct staff?
-* How many teams have non-direct staff to employees ratio above 20%?
-* How many teams are reporting to an organization leader?
-
-### Requirements: Technical Solution
-
-As part of this transformation, we are looking to build a centralized team
-management tool that will allow us to track team members, team locations,
-monthly team achievements, as well as individual-level and team-level metadata.
-Initial focus is to provide a self-service capability without any integrations
-with other tools such as Employee Directory, Project Tracking, or Performance
-Management.
-
-The technical solution involves developing a stand-alone web application using
-modern technologies. The application will have the following features:
-
-* User authentication and authorization
-* Role-based access control
-* CRUD operations for individuals, teams, achievements and metadata
-* Search and filter functionality
-* Responsive design for mobile and desktop usage
-
-### Requirements: Technology Stack
-
-The following technologies are required to build the application:
-
-* Frontend: HTML, CSS, React.js with React Responsive and Material UI Components
-* Backend: Python
-* Database: PostgreSQL
-
-The following technologies are good to know, as they are used to manage and
-deploy code:
-
-* Version Control: Git, GitHub
-* Infrastructure: Terraform
-* Deployment Mode: Shell Scripts
-* Deployment Target: AWS Serverless (e.g., S3, CloudFront, Lambda, DocumentDB)
-
-### Expectations: Value-Based Outcomes
-
-By the end of the workshop, participants will have developed a functional
-web application that meets the requirements outlined above. The application
-will be deployed to a cloud environment and accessible via a web browser.
-Participants will also gain hands-on experience with modern web development
-technologies and best practices.
-
-## Contributing
-
-See the [CONTRIBUTING](./CONTRIBUTING.md) resource for more details.
-
-## License
-
-This library is licensed under the MIT-0 License.
-See the [LICENSE](./LICENSE) resource for more details.
-
-## Roadmap
-
-See the
-[open issues](https://github.com/citi/coding-workshop-participant/issues)
-for a list of proposed roadmap features (and known issues).
-
-## Security
-
-See the
-[Security Issue Notifications](./CONTRIBUTING.md#security-issue-notifications)
-resource for more details.
-
-## Authors
-
-The following people have contributed to this workshop:
-
-* Colin Heilman - [@heilmancs](https://github.com/heilmancs)
-* Eugene Istrati - [@eistrati](https://github.com/eistrati)
-* Isaiah Cornelius Smith - [@corneliusmith](https://github.com/corneliusmith)
-* Juan Arevalo - [@jparevalo27](https://github.com/jparevalo27)
-* Michael Annucci - [@michael-annucci](https://github.com/michael-annucci)
-
-## Feedback
-
-We'd love to hear your feedback! Please:
-
-* ⭐ Star the repository if you find it helpful
-* 🐛 Report issues on GitHub
-* 💡 Suggest improvements
-* 📝 Share your experience
+# ACME Project Tracker
+Internal web app for ACME PMs to track projects, deliverables, resources, and
+budgets. **Read [`SYSTEM_DESIGN.md`](./SYSTEM_DESIGN.md) before touching code** —
+it is the single source of truth for stack, schema, API, and deployment rules.
+## Layout
+| Directory                                            | What lives here                                | README                                       |
+| ---------------------------------------------------- | ---------------------------------------------- | -------------------------------------------- |
+| [`backend/`](./backend/README.md)                    | One Lambda per service + shared `_lib`         | [`backend/README.md`](./backend/README.md)   |
+| [`backend/_db/migrations/`](./backend/_db/migrations)| Numbered SQL migrations (idempotent)           | n/a                                          |
+| [`frontend/`](./frontend/README.md)                  | React 19 + Vite 7 + TypeScript SPA             | [`frontend/README.md`](./frontend/README.md) |
+| [`infra/`](./infra/README.md)                        | Terraform: S3, CloudFront, Lambda, RDS, Cognito| [`infra/README.md`](./infra/README.md)       |
+| [`bin/`](./bin/README.md)                            | Setup, deploy, dev, migrate scripts            | [`bin/README.md`](./bin/README.md)           |
+| [`docs/`](./docs)                                    | Workshop notes (evaluation, testing, …)        | n/a                                          |
+## Local setup (Postgres + LocalStack in Docker)
+Both Postgres and LocalStack run as containers defined in
+[`docker-compose.yml`](./docker-compose.yml), attached to a shared
+`coding-workshop` Docker network so Lambdas spawned by LocalStack reach
+Postgres at hostname `postgres:5432` — no host-gateway IP juggling, no
+`pg_hba.conf` edits, no native `postgresql` service to babysit.
+```bash
+# 1. One-time host install (Docker, AWS CLI, Terraform — no host psql needed)
+./bin/setup-environment.sh
+# 2. Bring up Postgres + LocalStack + backend + frontend (one command)
+./bin/start-dev.sh
+```
+Or, if you want to run the pieces by hand:
+```bash
+cp .env.example .env                       # workshop-safe defaults; edit to taste
+docker compose up -d postgres localstack   # start the containers
+./bin/migrate.sh local                     # apply SQL migrations (psql runs in-container)
+./bin/deploy-backend.sh local              # terraform apply against LocalStack
+./bin/generate-env.sh && cd frontend && npm run dev
+```
+Ad-hoc SQL: `docker compose exec postgres psql -U postgres` — the host has no
+`psql` binary; everything runs inside the `postgres:17` container.
+Open <http://localhost:3000>. Auth is bypassed locally (`IS_LOCAL=true`); the
+backend treats every request as a fixed dev admin user. See `SYSTEM_DESIGN.md`
+§10 for why (LocalStack Cognito is a Pro feature).
+Stop the local stack:
+```bash
+docker compose down            # keep volumes (data persists)
+docker compose down --volumes  # nuke Postgres + LocalStack state
+```
+## AWS deployment (workshop)
+```bash
+./bin/setup-participant.sh             # one-time per AWS account/role
+./bin/deploy-backend.sh aws            # terraform apply (RDS, Cognito, S3, CF, Lambdas)
+./bin/migrate.sh aws                   # psql against the new Aurora cluster
+./bin/deploy-frontend.sh aws           # vite build → s3 sync → CloudFront invalidate
+```
+`terraform output cloudfront_distribution_url` prints the live URL. Aurora's
+first request after idle takes 15–30 s (`min_capacity=0`) — the landing page
+shows a "warming up" indicator.
+## Tear-down
+```bash
+./bin/cleanup-environment.sh           # terraform destroy + docker compose down --volumes
+```
+## Rules at a glance
+- **One Lambda per service** — `backend/<svc>/function.py`. Auto-discovered by `infra/locals.tf`.
+- **No web framework on Lambda.** Dispatch on `event["requestContext"]["http"]["method"]` + `event["rawPath"]`.
+- **All AWS resources via Terraform.** No ClickOps, no `aws … create-*`, no SDK provisioning. Drift = bug.
+- **SQL is `psycopg` parameterized only.** No f-strings into SQL.
+- **JWT verified in-handler.** Function URLs are `authorization_type=NONE`; the in-handler check is the only guard.
+Workshop docs: [`docs/`](./docs).
+## CI security checks
+Workflows under `.github/workflows/` run on every push and pull request:
+| Workflow                 | Image / action                  | Scope                                        |
+| ------------------------ | ------------------------------- | -------------------------------------------- |
+| `python.actions.yml`     | `bandit`                        | Backend Python static analysis.              |
+| `react.actions.yml`      | `npm audit`                     | Frontend dependency CVEs (high+).            |
+| `terraform.actions.yml`  | `bridgecrewio/checkov-action`   | Terraform misconfiguration scan.             |
+| `semgrep.actions.yml`    | `returntocorp/semgrep:latest`   | Multi-language SAST (security, OWASP, IaC).  |
+| `gitleaks.actions.yml`   | `zricethezav/gitleaks:latest`   | Secret scanning across full git history.     |
+Reproduce locally:
+```bash
+docker run --rm -v "$PWD:/src" returntocorp/semgrep:latest semgrep ci
+docker run --rm -v "$PWD:/repo" zricethezav/gitleaks:latest \
+    detect --source=/repo --config=/repo/.gitleaks.toml
+```
+Allow-listed false positives (workshop placeholders, LocalStack dummy creds)
+live in `.gitleaks.toml` — extend it, don't disable the workflow.
+## Dependency policy (Renovate)
+`renovate.json` + `.github/workflows/renovate.actions.yml` configure Renovate
+to open PRs **only when a HIGH or CRITICAL vulnerability is patched** in one
+of our dependencies (npm, pip, Terraform providers, GitHub Actions, Docker).
+Routine version bumps, lockfile maintenance, and LOW/MODERATE advisories are
+suppressed so the PR queue stays focused on real security work.
+To enable in a fork:
+1. Either install the [Mend Renovate GitHub App](https://github.com/apps/renovate)
+   on the repo (it will pick up `renovate.json` automatically) **or** create a
+   `RENOVATE_TOKEN` secret with a PAT (repo + workflow scope) so the
+   self-hosted workflow can run.
+2. Confirm GitHub Dependabot alerts are turned on in Settings → Code security.
+   Renovate reads severity from that graph.
