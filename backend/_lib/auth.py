@@ -70,12 +70,12 @@ def verify_token(event: Mapping[str, Any]) -> dict[str, Any]:
     except jwt.PyJWTError as exc:
         raise AuthError(401, "Authentication required") from exc
     token_use = claims.get("token_use")
-    if token_use == "id":
+    if token_use == "id":  # nosec B105 - Cognito token_use claim value, not a password
         if _CLIENT_ID:
             aud = claims.get("aud")
             if aud != _CLIENT_ID and not (isinstance(aud, list) and _CLIENT_ID in aud):
                 raise AuthError(401, "Authentication required")
-    elif token_use == "access":
+    elif token_use == "access":  # nosec B105 - Cognito token_use claim value, not a password
         if _CLIENT_ID and claims.get("client_id") and claims["client_id"] != _CLIENT_ID:
             raise AuthError(401, "Authentication required")
     else:
