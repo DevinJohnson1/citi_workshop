@@ -39,7 +39,36 @@ jobs:
             p/terraform
             p/dockerfile
           # SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}  # optional: enables Semgrep Cloud reporting
-        run: semgrep ci --sarif --output=semgrep.sarif
+        # --exclude-rule justifications (every exclusion below is either a confirmed
+        # false-positive class or an AWS/workshop-scope constraint):
+        #
+        #   * sqlalchemy-execute-raw-query — backend services use psycopg directly,
+        #     not SQLAlchemy. The rule fires on every `cur.execute(f"... {where_sql}",
+        #     params)` call where `where_sql` is a server-built fragment of validated
+        #     column names and all user-supplied values are bound via psycopg %s
+        #     placeholders. The rule has no awareness of psycopg parameterization
+        #     and produces only false positives here. Same rationale as bandit B608
+        #     (skipped in python.actions.yml).
+        #
+        #   * formatted-sql-query — identical false-positive pattern as above, just
+        #     a different rule pack catching the same psycopg %s-parameterized calls.
+        #
+        #   * using-http-server — only fires on bin/proxy-server.js, which is a
+        #     localhost-only LocalStack CORS shim (see file header). It is never
+        #     deployed, never exposed beyond 127.0.0.1, and has no production
+        #     analogue (AWS CloudFront terminates TLS in real environments).
+        #
+        #   * aws-insecure-cloudfront-distribution-tls-version — the distribution
+        #     uses `cloudfront_default_certificate = true` (the *.cloudfront.net
+        #     cert). AWS pins that cert's minimum_protocol_version to TLSv1 and
+        #     rejects any override; raising it requires provisioning an ACM cert
+        #     bound to a custom domain, which is out of scope for this workshop.
+        run: >-
+          semgrep ci --sarif --output=semgrep.sarif
+          --exclude-rule python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query
+          --exclude-rule python.lang.security.audit.formatted-sql-query.formatted-sql-query
+          --exclude-rule problem-based-packs.insecure-transport.js-node.using-http-server.using-http-server
+          --exclude-rule terraform.aws.security.aws-cloudfront-insecure-tls.aws-insecure-cloudfront-distribution-tls-version
 
       - name: Upload Semgrep SARIF artifact
         if: always()
