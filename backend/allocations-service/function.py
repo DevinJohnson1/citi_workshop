@@ -23,6 +23,7 @@ from pydantic import Field, ValidationError
 
 from _lib import db, http
 from _lib.auth import AuthError, current_user, handle_auth_errors, verify_token
+from _lib.projects import is_project_lead
 from _lib.validation import StrictModel, first_error
 
 _LOG = logging.getLogger()
@@ -135,12 +136,18 @@ def _ensure_lead_can_write(user: dict, project_id: str) -> None:
         return
     if user["role"] != "team_lead":
         raise AuthError(403, "Insufficient role")
+    # Co-leads count as leads — see _lib/projects.is_project_lead.
+    if not is_project_lead(db.get_conn(), project_id, user["id"]):
+        raise AuthError(403, "Insufficient role")
+
+
+def _project_owner_id(project_id: str) -> str | None:
+    """Return the owner of a project, or ``None`` if it doesn't exist."""
     conn = db.get_conn()
     with conn.cursor() as cur:
         cur.execute("SELECT owner_id FROM projects WHERE id = %s", (project_id,))
         row = cur.fetchone()
-    if not row or row["owner_id"] != user["id"]:
-        raise AuthError(403, "Insufficient role")
+    return row["owner_id"] if row else None
 
 
 def _create(event: Mapping[str, Any]) -> dict[str, Any]:
@@ -156,9 +163,27 @@ def _create(event: Mapping[str, Any]) -> dict[str, Any]:
     if is_admin:
         approval_status = "approved"
     elif user["role"] == "team_lead":
-        # Team leads can only allocate on projects they own.
-        _ensure_lead_can_write(user, body.project_id)
-        approval_status = "approved"
+        # Two distinct sub-cases:
+        #   * Owning lead allocating anyone (including themselves) →
+        #     auto-approved, normal lead-of-project flow.
+        #   * Non-owning lead asking to join the project → treated as a
+        #     self-request (target=self, pending). They cannot allocate
+        #     other people onto a project they do not own, mirroring the
+        #     team_member rule. The owning lead must approve before any
+        #     write access (deliverables, resources) opens up.
+        is_self_only = body.user_id is None or body.user_id == user["id"]
+        owns_project = is_project_lead(db.get_conn(), body.project_id, user["id"])
+        if owns_project:
+            approval_status = "approved"
+        elif is_self_only:
+            target_user_id = user["id"]
+            approval_status = "pending"
+        else:
+            raise AuthError(
+                403,
+                "Non-owning team leads may only self-request allocations on "
+                "this project",
+            )
     elif user["role"] == "team_member":
         # Self-only. Team members may NOT allocate other people.
         if body.user_id and body.user_id != user["id"]:
@@ -236,9 +261,11 @@ def _delete(event: Mapping[str, Any], allocation_id: str) -> dict[str, Any]:
         existing = cur.fetchone()
     if not existing:
         return http.not_found(event=event)
-    # Team members may withdraw their own pending self-requests.
+    # Any non-admin user (team_member OR non-owning team_lead) may withdraw
+    # their OWN pending self-request. Approved / rejected rows still require
+    # the owning lead or an admin to delete — the audit trail matters.
     is_self_pending_withdraw = (
-        user["role"] == "team_member"
+        user["role"] in {"team_member", "team_lead"}
         and existing["user_id"] == user["id"]
         and existing["approval_status"] == "pending"
     )

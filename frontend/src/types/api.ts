@@ -20,16 +20,20 @@ export interface User {
    */
   active_project_count?: number;
   /**
-   * Number of open assignments (assignments with `completed_at IS NULL`)
-   * the user currently holds across every deliverable. Computed
-   * server-side in resources-service.  Optional for the same reason as
-   * `active_project_count`.
+   * Number of *in-flight* assignments the user currently holds: the
+   * per-assignment row has not been completed (`completed_at IS NULL`)
+   * AND the parent deliverable is not yet `done`/`cancelled` (a lead
+   * marking the deliverable Done releases the assignees from the
+   * overwork count even if their personal tick was never set).
+   * Computed server-side in resources-service. Optional for the same
+   * reason as `active_project_count`.
    */
   active_deliverable_count?: number;
   /**
    * Derived server-side flag: `true` when the user has more than 3 active
-   * projects OR more than 10 open deliverable assignments.  Thresholds
-   * live in `backend/resources-service/function.py`.
+   * projects OR more than 5 in-flight deliverable assignments (open and
+   * whose deliverable is not yet done/cancelled). Thresholds live in
+   * `backend/resources-service/function.py`.
    */
   is_overworked?: boolean;
 }
@@ -43,6 +47,14 @@ export interface Project {
   target_end_date: string | null;
   actual_end_date: string | null;
   owner_id: string;
+  /**
+   * Owner + co-lead ids in display order (owner first, co-leads in insertion
+   * order). Surfaced by projects-service so the SPA can render multi-lead
+   * UIs without a second roundtrip. Older payloads that pre-date the
+   * `project_leads` table omit this field; treat missing/empty as
+   * "[owner_id]".
+   */
+  lead_ids?: string[];
   created_at: string;
   updated_at: string;
   /**

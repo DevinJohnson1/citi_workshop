@@ -107,7 +107,8 @@ export function useApi(): ApiClient {
      * Run `fetch` and convert transport-layer `TypeError`s (the browser's
      * generic "Failed to fetch" — DNS failure, refused connection, CORS
      * preflight rejection, mid-flight socket close) into a message that
-     * names the URL we tried.
+     * names the URL we tried AND tells the developer the most likely fix
+     * in the dev loop, which is "the backend proxy on :3001 isn't up".
      */
     const doFetch = async <T,>(url: string, init: RequestInit): Promise<T> => {
       let res: Response;
@@ -115,7 +116,13 @@ export function useApi(): ApiClient {
         res = await fetch(url, init);
       } catch (err) {
         const cause = err instanceof Error ? err.message : String(err);
-        throw new Error(`Network error calling ${init.method ?? 'GET'} ${url}: ${cause}`, { cause: err });
+        const localHint = url.startsWith('/api') || url.includes('localhost:3001')
+          ? ' — is the dev stack running? (run `bin/start-dev.sh` or check that the CORS proxy on :3001 is alive)'
+          : '';
+        throw new Error(
+          `Network error calling ${init.method ?? 'GET'} ${url}: ${cause}${localHint}`,
+          { cause: err },
+        );
       }
       return handle<T>(res);
     };

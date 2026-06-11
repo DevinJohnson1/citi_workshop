@@ -28,6 +28,7 @@ from pydantic import Field, ValidationError
 
 from _lib import db, http
 from _lib.auth import AuthError, current_user, handle_auth_errors, verify_token
+from _lib.projects import is_project_lead
 from _lib.validation import StrictModel, first_error
 
 _LOG = logging.getLogger()
@@ -198,9 +199,50 @@ def _list_kinds(event: Mapping[str, Any]) -> dict[str, Any]:
 
 # ── writes ─────────────────────────────────────────────────────────────────
 
-def _can_approve(role: str) -> bool:
-    """Equipment is org-wide — any admin or team_lead may approve."""
-    return role in {"admin", "team_lead"}
+def _project_owner(conn, project_id: str) -> str | None:
+    """Return the owner of a project, or ``None`` if no such project exists."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT owner_id FROM projects WHERE id = %s", (project_id,))
+        row = cur.fetchone()
+    return row["owner_id"] if row else None
+
+
+def _user_approved_on_project(conn, user_id: str, project_id: str) -> bool:
+    """True if the user holds an *approved* allocation on the project.
+
+    Mirrors the same gate enforced by deliverables-service and
+    assignments-service: contributors must be accepted onto a project via an
+    approved allocation before they may add resources to it.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT 1 FROM allocations "
+            " WHERE user_id = %s AND project_id = %s "
+            "   AND approval_status = 'approved' LIMIT 1",
+            (user_id, project_id),
+        )
+        return cur.fetchone() is not None
+
+
+def _can_approve_for_project(conn, user: dict, project_id: str | None) -> bool:
+    """True when ``user`` may flip an equipment row's approval_status.
+
+    Equipment approval is intentionally **project-scoped** — see the user
+    requirement that tangibles/intangibles can only be approved from
+    within a project:
+
+      * Items attached to a project are approved by the owning team_lead
+        of that project, or by an admin.
+      * Items with no project assignment can only be approved by admin
+        (no project context means no lead has authority over them).
+    """
+    if user["role"] == "admin":
+        return True
+    if project_id is None:
+        return False
+    if user["role"] != "team_lead":
+        return False
+    return is_project_lead(conn, project_id, user["id"])
 
 
 def _enforce_budget(
@@ -270,15 +312,51 @@ def _enforce_budget(
 def _create(event: Mapping[str, Any]) -> dict[str, Any]:
     user = current_user(event)
     body = EquipmentCreate(**http.parse_json_body(event))
+    conn = db.get_conn()
 
-    if user["role"] in {"admin", "team_lead"}:
-        approval_status = "approved"
-    elif user["role"] == "team_member":
-        # Team members can propose any tangible asset; a lead must approve.
-        approval_status = "pending"
-    else:
+    # ── authorisation ─────────────────────────────────────────────────
+    # Equipment splits into two write paths:
+    #   1. catalog-only (assigned_project_id is None):
+    #        admin / team_lead → approved; team_member → pending. No
+    #        per-project allocation gate because there is no project yet.
+    #   2. project-attached (assigned_project_id is set):
+    #        admin / owning lead   → approved.
+    #        other lead / member   → require an *approved* allocation on
+    #                                 that project; the row lands pending
+    #                                 and the owning lead must accept it.
+    #        anyone else           → 403.
+    #
+    # Approval (via PATCH) is project-scoped (see _can_approve_for_project),
+    # which is why every project-attached create that isn't from admin or
+    # the owning lead must start life as pending — the only people who can
+    # flip it are the project's own owner and admins.
+    if user["role"] not in {"admin", "team_lead", "team_member"}:
         # Viewers and unknown roles are read-only.
         raise AuthError(403, "Insufficient role")
+
+    if body.assigned_project_id is None:
+        approval_status = "approved" if user["role"] in {"admin", "team_lead"} else "pending"
+    else:
+        owner = _project_owner(conn, body.assigned_project_id)
+        if owner is None:
+            return http.not_found("Project not found", event)
+        is_owning_lead = (
+            user["role"] == "team_lead"
+            and is_project_lead(conn, body.assigned_project_id, user["id"])
+        )
+        if user["role"] == "admin" or is_owning_lead:
+            approval_status = "approved"
+        elif _user_approved_on_project(conn, user["id"], body.assigned_project_id):
+            # Allocated contributor (lead or member): may propose for the
+            # project, but the owning lead must accept it before it counts
+            # toward the budget.
+            approval_status = "pending"
+        else:
+            raise AuthError(
+                403,
+                "You must hold an approved allocation on this project to add "
+                "resources to it",
+            )
 
     approved_by = user["id"] if approval_status == "approved" else None
     approved_at = datetime.now(timezone.utc) if approval_status == "approved" else None
@@ -287,7 +365,7 @@ def _create(event: Mapping[str, Any]) -> dict[str, Any]:
     # not even inside a rolled-back transaction (the audit log would still
     # show it otherwise).
     _enforce_budget(
-        db.get_conn(), body.assigned_project_id, body.cost, approval_status,
+        conn, body.assigned_project_id, body.cost, approval_status,
     )
 
     with db.transaction() as conn, conn.cursor() as cur:
@@ -341,19 +419,46 @@ def _patch(event: Mapping[str, Any], equipment_id: str) -> dict[str, Any]:
         return http.not_found(event=event)
 
     # Authorisation rules:
-    #   - admin / team_lead may PATCH anything (approve, reassign, edit).
-    #   - team_member may edit their own *pending* row (e.g. fix a typo)
-    #     but may not flip approval_status — only leads can do that.
-    is_owner_pending_edit = (
-        user["role"] == "team_member"
-        and existing["requested_by"] == user["id"]
+    #   - admin                       → may PATCH anything (approve, reassign, edit).
+    #   - team_lead owning the item's project → may PATCH anything *on that
+    #     item* (approve, reassign, edit). Approval is intentionally
+    #     project-scoped so leads cannot rubber-stamp items belonging to a
+    #     project they have no responsibility for.
+    #   - any other team_lead         → may edit non-approval fields only
+    #     when they are themselves the requester (lets a lead correct a
+    #     typo on their own pending proposal).
+    #   - team_member                 → may edit their own *pending* row
+    #     (no approval_status flip).
+    is_admin = user["role"] == "admin"
+    is_owning_lead = (
+        user["role"] == "team_lead"
+        and existing["assigned_project_id"] is not None
+        and is_project_lead(conn, existing["assigned_project_id"], user["id"])
+    )
+    is_self_pending_edit = (
+        existing["requested_by"] == user["id"]
         and existing["approval_status"] == "pending"
     )
-    if not _can_approve(user["role"]):
-        if not is_owner_pending_edit:
+
+    flipping_approval = "approval_status" in fields
+    if flipping_approval:
+        # Approval can only happen via the owning project's lead or admin —
+        # the global ResourcesPage cannot approve items because there is no
+        # project context for the gate. See _can_approve_for_project.
+        resulting_project = fields.get(
+            "assigned_project_id", existing["assigned_project_id"],
+        )
+        if not _can_approve_for_project(conn, user, resulting_project):
+            raise AuthError(
+                403,
+                "Only the project's owning team lead (or an admin) may "
+                "approve resources for that project",
+            )
+    elif not (is_admin or is_owning_lead):
+        # Non-approval edit: must be the requester editing their own
+        # pending row.
+        if not is_self_pending_edit:
             raise AuthError(403, "Insufficient role")
-        if "approval_status" in fields:
-            raise AuthError(403, "Only leads may change approval_status")
 
     # Stamp approval metadata when transitioning to a terminal state.
     if "approval_status" in fields and fields["approval_status"] in {"approved", "rejected"}:

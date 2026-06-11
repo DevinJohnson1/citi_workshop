@@ -17,8 +17,8 @@ export function OidcCallback() {
   }, [auth.isAuthenticated, navigate]);
 
   if (auth.error) {
-    return <p className="p-8 text-sm text-red-600">Sign-in failed: {auth.error.message}</p>;
+    return <p className="p-8 text-sm text-ember-500">Sign-in failed: {auth.error.message}</p>;
   }
-  return <p className="p-8 text-sm text-gray-600">Completing sign-in…</p>;
+  return <p className="p-8 text-sm text-ink-500">Completing sign-in…</p>;
 }
 

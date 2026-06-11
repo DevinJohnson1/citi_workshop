@@ -27,7 +27,7 @@ _SERVICE = "reports-service"
 # `is_overworked` flag and this org-wide rollup never disagree. A user is
 # over-assigned when EITHER threshold is exceeded.
 _OVERWORK_PROJECT_THRESHOLD = 3
-_OVERWORK_DELIVERABLE_THRESHOLD = 10
+_OVERWORK_DELIVERABLE_THRESHOLD = 5
 
 
 def handler(event: Mapping[str, Any], context: Any = None) -> dict[str, Any]:
@@ -146,9 +146,13 @@ def _over_assigned() -> dict[str, Any]:
 
       * the number of distinct projects they hold at least one approved
         allocation on exceeds ``_OVERWORK_PROJECT_THRESHOLD`` (default 3), OR
-      * the number of open assignments they hold across every deliverable
-        (``completed_at IS NULL``) exceeds
-        ``_OVERWORK_DELIVERABLE_THRESHOLD`` (default 10).
+      * the number of *in-flight* assignments they hold across every
+        deliverable exceeds ``_OVERWORK_DELIVERABLE_THRESHOLD`` (default 5).
+        "In-flight" means the per-assignment row has not been completed
+        (``completed_at IS NULL``) AND the parent deliverable is not
+        already ``done`` or ``cancelled`` — once a lead marks the
+        deliverable Done, it stops counting against the assignee's
+        workload even if the per-assignment tick was never set.
 
     This rule replaces the legacy ``SUM(assignments.percent) > 100`` check
     which became meaningless after migration 005 dropped a uniform notion of
@@ -171,8 +175,11 @@ def _over_assigned() -> dict[str, Any]:
                 ), 0) AS active_project_count,
                 COALESCE((
                     SELECT COUNT(*)
-                    FROM assignments
-                    WHERE user_id = u.id AND completed_at IS NULL
+                    FROM assignments asg
+                    JOIN deliverables d ON d.id = asg.deliverable_id
+                    WHERE asg.user_id = u.id
+                      AND asg.completed_at IS NULL
+                      AND d.status NOT IN ('done','cancelled')
                 ), 0) AS active_deliverable_count
             FROM users u
             WHERE u.role IN ('team_lead','team_member')
@@ -231,27 +238,28 @@ def _allocation_by_user(qs: dict[str, str]) -> dict[str, Any]:
 
 
 def _deliverable_completion(project_id: str | None) -> dict[str, Any]:
-    """Percent of deliverables whose every assignment is completed."""
+    """Percent of a project's deliverables that have reached ``status='done'``.
+
+    A deliverable is "complete" iff its own ``status`` column is ``done`` —
+    the same signal the StatusBadge shows everywhere else in the UI. The
+    earlier rule keyed off ``assignments.completed_at`` and therefore
+    disagreed with the deliverable's visible status (e.g. a row marked
+    "done" by the team-lead but with no per-assignment completion ticks
+    counted as 0%, while a row with no assignments at all looked the same).
+
+    ``cancelled`` deliverables are excluded from the denominator: they
+    were de-scoped and dragging them into the percentage would penalise
+    the project for *not* doing work that was deliberately dropped.
+    """
     if not project_id:
         raise ValueError("project_id: query parameter is required")
     rows = _rows(
         """
-        WITH d AS (
-            SELECT id FROM deliverables WHERE project_id = %s
-        ),
-        completion AS (
-            SELECT d.id,
-                   CASE
-                     WHEN NOT EXISTS (SELECT 1 FROM assignments a WHERE a.deliverable_id = d.id) THEN FALSE
-                     WHEN EXISTS (SELECT 1 FROM assignments a
-                                  WHERE a.deliverable_id = d.id AND a.completed_at IS NULL) THEN FALSE
-                     ELSE TRUE
-                   END AS is_complete
-            FROM d
-        )
-        SELECT COUNT(*) AS total,
-               SUM(CASE WHEN is_complete THEN 1 ELSE 0 END) AS completed
-        FROM completion
+        SELECT
+            COUNT(*) FILTER (WHERE status <> 'cancelled')               AS total,
+            COUNT(*) FILTER (WHERE status = 'done')                     AS completed
+        FROM deliverables
+        WHERE project_id = %s
         """,
         (project_id,),
     )

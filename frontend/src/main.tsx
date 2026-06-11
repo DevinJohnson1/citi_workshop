@@ -3,6 +3,11 @@ import { createRoot } from 'react-dom/client';
 import './index.css';
 import { App } from './App';
 import { ConditionalAuthProvider } from './auth/ConditionalAuthProvider';
+import { applyTheme, getInitialTheme } from './utils/theme';
+
+// Apply the persisted (or OS-preferred) theme synchronously, before React
+// renders, so the page never flashes the wrong palette.
+applyTheme(getInitialTheme());
 
 const rootEl = document.getElementById('root');
 if (!rootEl) {

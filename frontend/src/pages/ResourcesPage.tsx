@@ -4,7 +4,6 @@ import { useApi, ApiError, type ListResponse } from '../services/apiClient';
 import { useRole } from '../auth/useRole';
 import { OverworkBadge } from '../components/OverworkBadge';
 import type {
-  ApprovalStatus,
   Deliverable,
   Equipment,
   EquipmentStatus,
@@ -12,8 +11,14 @@ import type {
   ResourceKind,
   User,
 } from '../types/api';
+import { equipmentStatusLabel, approvalLabel, roleLabel } from '../utils/labels';
+import { StatusBadge } from '../components/ui/StatusBadge';
+import { Avatar } from '../components/ui/AvatarStack';
+import { SortableHeader } from '../components/ui/SortableHeader';
+import { SmartSearch } from '../components/SmartSearch';
+import { useSortableTable } from '../utils/useSortableTable';
 
-type Tab = Extract<ResourceKind, 'people' | 'deliverables' | 'tangibles' | 'intangibles'>;
+type Tab = Extract<ResourceKind, 'people' | 'deliverables' | 'tangibles' | 'intangibles'> | 'search';
 interface TabSpec {
   key: Tab;
   label: string;
@@ -41,6 +46,14 @@ const TABS: TabSpec[] = [
     label: 'Intangibles',
     description: 'Non-physical resources: software licenses, SaaS subscriptions, certifications, training credits, API quotas.',
   },
+  {
+    key: 'search',
+    // Cross-resource lookup — searches names across deliverables,
+    // allocations, tangibles, and intangibles in a single query with an
+    // optional type filter. Mirrored on each project's detail page.
+    label: 'Search',
+    description: 'Smart name search across every resource type in the organisation.',
+  },
 ];
 
 /** Kind input is free-form — no autocomplete suggestions are surfaced. */
@@ -67,12 +80,12 @@ export function ResourcesPage() {
     <section className="space-y-4">
       <header>
         <h1 className="text-xl font-semibold">Resources</h1>
-        <p className="text-sm text-gray-600">
+        <p className="text-sm text-ink-500">
           Project resources by type. Budget is tracked per project — open a project to view it.
         </p>
       </header>
 
-      <div role="tablist" aria-label="Resource type" className="flex flex-wrap gap-1 border-b border-gray-200">
+      <div role="tablist" aria-label="Resource type" className="flex flex-wrap gap-1 border-b border-line">
         {TABS.map((t) => {
           const selected = t.key === tab;
           return (
@@ -83,7 +96,7 @@ export function ResourcesPage() {
               aria-selected={selected}
               tabIndex={selected ? 0 : -1}
               onClick={() => setTab(t.key)}
-              className={`px-3 py-2 text-sm ${selected ? 'border-b-2 border-brand-600 text-brand-700' : 'text-gray-600 hover:text-gray-900'}`}
+              className={`px-3 py-2 text-sm ${selected ? 'border-b-2 border-brand-600 text-brand-700' : 'text-ink-500 hover:text-ink-900'}`}
             >
               {t.label}
             </button>
@@ -91,13 +104,14 @@ export function ResourcesPage() {
         })}
       </div>
 
-      <p className="text-xs text-gray-500">{TABS.find((t) => t.key === tab)?.description}</p>
+      <p className="text-xs text-ink-400">{TABS.find((t) => t.key === tab)?.description}</p>
 
       <div role="tabpanel">
         {tab === 'people' && <PeopleTab />}
         {tab === 'deliverables' && <DeliverablesTab />}
         {tab === 'tangibles' && <EquipmentTab isTangible={true} />}
         {tab === 'intangibles' && <EquipmentTab isTangible={false} />}
+        {tab === 'search' && <SmartSearch />}
       </div>
     </section>
   );
@@ -120,43 +134,59 @@ function PeopleTab() {
       .finally(() => setLoading(false));
   }, [apiGet]);
 
+  // Sortable columns. Workload is sorted by the boolean flag so overworked
+  // people bubble to the top when descending.
+  const { sorted, sort, setSort } = useSortableTable(rows, {
+    name:        (u) => u.full_name ?? '',
+    email:       (u) => u.email,
+    job_title:   (u) => u.job_title ?? '',
+    role:        (u) => roleLabel(u.role),
+    hours:       (u) => u.weekly_capacity_hours,
+    projects:    (u) => u.active_project_count ?? -1,
+    open_delivs: (u) => u.active_deliverable_count ?? -1,
+    workload:    (u) => (u.is_overworked ? 1 : 0),
+  }, { key: 'name', dir: 'asc' });
+
   return (
-    <div className="overflow-x-auto rounded border border-gray-200 bg-white">
-      {loading && <p className="px-3 py-2 text-sm text-gray-500">Loading…</p>}
-      {error && <p className="px-3 py-2 text-sm text-red-600">{error}</p>}
+    <div className="overflow-x-auto rounded border border-line bg-surface">
+      {loading && <p className="px-4 py-3 text-sm text-ink-400">Loading…</p>}
+      {error && <p className="px-4 py-3 text-sm text-ember-500">{error}</p>}
       {!loading && !error && (
         <table className="min-w-full text-sm">
-          <thead className="bg-gray-50 text-left text-gray-700">
+          <thead className="bg-surface-2 text-left text-ink-700">
             <tr>
-              <th scope="col" className="px-3 py-2">Name</th>
-              <th scope="col" className="px-3 py-2">Email</th>
-              <th scope="col" className="px-3 py-2">Job title</th>
-              <th scope="col" className="px-3 py-2">Role</th>
-              <th scope="col" className="px-3 py-2">Weekly hours</th>
-              <th scope="col" className="px-3 py-2 text-right" title="Distinct projects with an approved allocation">Projects</th>
-              <th scope="col" className="px-3 py-2 text-right" title="Open assignments (not yet completed) across all deliverables">Open deliverables</th>
-              <th scope="col" className="px-3 py-2">Workload</th>
+              <SortableHeader sortKey="name"        sort={sort} setSort={setSort}>Name</SortableHeader>
+              <SortableHeader sortKey="email"       sort={sort} setSort={setSort}>Email</SortableHeader>
+              <SortableHeader sortKey="job_title"   sort={sort} setSort={setSort}>Job title</SortableHeader>
+              <SortableHeader sortKey="role"        sort={sort} setSort={setSort}>Role</SortableHeader>
+              <SortableHeader sortKey="hours"       sort={sort} setSort={setSort} align="right">Weekly hours</SortableHeader>
+              <SortableHeader sortKey="projects"    sort={sort} setSort={setSort} align="right" title="Distinct projects with an approved allocation">Projects</SortableHeader>
+              <SortableHeader sortKey="open_delivs" sort={sort} setSort={setSort} align="right" title="Open assignments (not yet completed) across all deliverables">Open deliverables</SortableHeader>
+              <SortableHeader sortKey="workload"    sort={sort} setSort={setSort}>Workload</SortableHeader>
             </tr>
           </thead>
           <tbody>
-            {rows.length === 0 && (
-              <tr><td colSpan={8} className="px-3 py-4 text-gray-500">No allocatable users.</td></tr>
+            {sorted.length === 0 && (
+              <tr><td colSpan={8} className="px-4 py-5 text-ink-400">No allocatable users.</td></tr>
             )}
-            {rows.map((u) => (
-              <tr key={u.id} className="border-t border-gray-100">
-                <td className="px-3 py-2">
-                  {u.full_name || '—'}
+            {sorted.map((u) => (
+              <tr key={u.id} className="border-t border-line">
+                <td className="px-4 py-2.5">
+                  <span className="flex items-center gap-2">
+                    <Avatar name={u.full_name} email={u.email} hueKey={u.id} size="sm" />
+                    <span>{u.full_name || '—'}</span>
+                  </span>
                 </td>
-                <td className="px-3 py-2">{u.email}</td>
-                <td className="px-3 py-2">{u.job_title || '—'}</td>
-                <td className="px-3 py-2"><span className="rounded bg-gray-100 px-1.5 py-0.5 text-xs">{u.role}</span></td>
-                <td className="px-3 py-2">{u.weekly_capacity_hours}</td>
-                <td className="px-3 py-2 text-right tabular-nums">{u.active_project_count ?? '—'}</td>
-                <td className="px-3 py-2 text-right tabular-nums">{u.active_deliverable_count ?? '—'}</td>
-                <td className="px-3 py-2">
+                <td className="px-4 py-2.5">{u.email}</td>
+                <td className="px-4 py-2.5">{u.job_title || '—'}</td>
+                <td className="px-4 py-2.5"><span className="rounded bg-surface-2 px-1.5 py-0.5 text-xs">{roleLabel(u.role)}</span></td>
+                <td className="px-4 py-2.5 text-right tabular-nums">{u.weekly_capacity_hours}</td>
+                <td className="px-4 py-2.5 text-right tabular-nums">{u.active_project_count ?? '—'}</td>
+                <td className="px-4 py-2.5 text-right tabular-nums">{u.active_deliverable_count ?? '—'}</td>
+                <td className="px-4 py-2.5">
                   {u.is_overworked
                     ? <OverworkBadge user={u} />
-                    : <span className="text-xs text-gray-400">ok</span>}
+                    : <span className="text-xs text-ink-300">ok</span>}
                 </td>
               </tr>
             ))}
@@ -174,49 +204,68 @@ function PeopleTab() {
 function DeliverablesTab() {
   const { apiGet } = useApi();
   const [rows, setRows] = useState<Deliverable[]>([]);
+  const [projects, setProjects] = useState<Project[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    apiGet<ListResponse<Deliverable>>('/deliverables-service?limit=100')
-      .then((res) => setRows(res.data))
+    Promise.all([
+      apiGet<ListResponse<Deliverable>>('/deliverables-service?limit=100'),
+      apiGet<ListResponse<Project>>('/projects-service?limit=100')
+        .catch(() => ({ data: [] as Project[], meta: { total: 0, limit: 0, offset: 0 } })),
+    ])
+      .then(([res, projs]) => {
+        setRows(res.data);
+        setProjects(projs.data);
+      })
       .catch((err: Error) => setError(err.message))
       .finally(() => setLoading(false));
   }, [apiGet]);
+
+  const projectName = (id: string): string =>
+    projects.find((p) => p.id === id)?.name ?? '';
+
+  // Sort by project name (not id) so the "Project" column groups visibly.
+  const { sorted, sort, setSort } = useSortableTable(rows, {
+    title:   (d) => d.title,
+    status:  (d) => d.status,
+    due:     (d) => d.due_date ?? '',
+    project: (d) => projectName(d.project_id),
+  }, { key: 'title', dir: 'asc' });
 
   return (
     <div className="space-y-3">
       {/* Pointer to where deliverables actually get created — this tab is a
           read-only rollup, easy to mistake for a CRUD surface. */}
-      <p className="rounded border border-blue-200 bg-blue-50 px-3 py-2 text-xs text-blue-900">
+      <p className="rounded border border-sky-100 bg-sky-50 px-3 py-2 text-xs text-sky-700">
         Deliverables live inside a project. To add or edit one, open a project
         from the <Link to="/projects" className="font-medium underline">Projects</Link> list and use the Deliverables section there.
       </p>
-      <div className="overflow-x-auto rounded border border-gray-200 bg-white">
-        {loading && <p className="px-3 py-2 text-sm text-gray-500">Loading…</p>}
-        {error && <p className="px-3 py-2 text-sm text-red-600">{error}</p>}
+      <div className="overflow-x-auto rounded border border-line bg-surface">
+        {loading && <p className="px-4 py-3 text-sm text-ink-400">Loading…</p>}
+        {error && <p className="px-4 py-3 text-sm text-ember-500">{error}</p>}
         {!loading && !error && (
           <table className="min-w-full text-sm">
-            <thead className="bg-gray-50 text-left text-gray-700">
+            <thead className="bg-surface-2 text-left text-ink-700">
               <tr>
-                <th scope="col" className="px-3 py-2">Title</th>
-                <th scope="col" className="px-3 py-2">Status</th>
-                <th scope="col" className="px-3 py-2">Due</th>
-                <th scope="col" className="px-3 py-2">Project</th>
+                <SortableHeader sortKey="title"   sort={sort} setSort={setSort}>Title</SortableHeader>
+                <SortableHeader sortKey="status"  sort={sort} setSort={setSort}>Status</SortableHeader>
+                <SortableHeader sortKey="due"     sort={sort} setSort={setSort}>Due</SortableHeader>
+                <SortableHeader sortKey="project" sort={sort} setSort={setSort}>Project</SortableHeader>
               </tr>
             </thead>
             <tbody>
-              {rows.length === 0 && (
-                <tr><td colSpan={4} className="px-3 py-4 text-gray-500">No deliverables yet — create one from a project page.</td></tr>
+              {sorted.length === 0 && (
+                <tr><td colSpan={4} className="px-4 py-5 text-ink-400">No deliverables yet — create one from a project page.</td></tr>
               )}
-              {rows.map((d) => (
-                <tr key={d.id} className="border-t border-gray-100">
-                  <td className="px-3 py-2">{d.title}</td>
-                  <td className="px-3 py-2">{d.status}</td>
-                  <td className="px-3 py-2">{d.due_date ?? '—'}</td>
-                  <td className="px-3 py-2">
+              {sorted.map((d) => (
+                <tr key={d.id} className="border-t border-line">
+                  <td className="px-4 py-2.5">{d.title}</td>
+                  <td className="px-4 py-2.5"><StatusBadge status={d.status} /></td>
+                  <td className="px-4 py-2.5">{d.due_date ?? '—'}</td>
+                  <td className="px-4 py-2.5">
                     <Link to={`/projects/${d.project_id}`} className="text-brand-700 hover:underline">
-                      Open
+                      {projectName(d.project_id) || 'Open'}
                     </Link>
                   </td>
                 </tr>
@@ -234,11 +283,14 @@ function DeliverablesTab() {
 // ---------------------------------------------------------------------------
 
 function EquipmentTab({ isTangible }: { isTangible: boolean }) {
-  const { apiGet, apiPost, apiPatch, apiDelete } = useApi();
+  const { apiGet, apiPost, apiDelete } = useApi();
   const role = useRole();
   const canWrite = role === 'admin' || role === 'team_lead';
   const canSelfRequest = role === 'team_member';
-  const canApprove = canWrite;
+  // Approval is intentionally **not** offered on this global page — every
+  // tangible/intangible can only be accepted from inside the project it's
+  // attached to (see ProjectEquipmentPanel). Showing approve/reject here
+  // would let any lead rubber-stamp items on projects they don't own.
   const canDelete = role === 'admin';
 
   const noun = isTangible ? 'tangible' : 'intangible';
@@ -311,16 +363,6 @@ function EquipmentTab({ isTangible }: { isTangible: boolean }) {
     }
   };
 
-  const handleApproval = async (id: string, approval: ApprovalStatus): Promise<void> => {
-    setError(null);
-    try {
-      await apiPatch<Equipment>(`/equipment-service/${id}`, { approval_status: approval });
-      reload();
-    } catch (err) {
-      setError(err instanceof ApiError ? err.message : (err as Error).message);
-    }
-  };
-
   const handleRemove = async (id: string): Promise<void> => {
     setError(null);
     try {
@@ -336,89 +378,78 @@ function EquipmentTab({ isTangible }: { isTangible: boolean }) {
   const projectById = (id: string | null): Project | undefined =>
     id ? projects.find((p) => p.id === id) : undefined;
 
+  const { sorted, sort, setSort } = useSortableTable(rows, {
+    name:     (e) => e.name,
+    kind:     (e) => e.kind,
+    status:   (e) => e.status,
+    approval: (e) => e.approval_status,
+    cost:     (e) => e.cost ?? -1,
+    project:  (e) => projectById(e.assigned_project_id)?.name ?? '',
+  }, { key: 'name', dir: 'asc' });
+
   return (
     <div className="space-y-4">
-      {error && <p className="text-sm text-red-600">{error}</p>}
-      <div className="overflow-x-auto rounded border border-gray-200 bg-white">
-        {loading && <p className="px-3 py-2 text-sm text-gray-500">Loading…</p>}
+      {error && <p className="text-sm text-ember-500">{error}</p>}
+      <div className="overflow-x-auto rounded border border-line bg-surface">
+        {loading && <p className="px-4 py-3 text-sm text-ink-400">Loading…</p>}
         {!loading && (
           <table className="min-w-full text-sm">
-            <thead className="bg-gray-50 text-left text-gray-700">
+            <thead className="bg-surface-2 text-left text-ink-700">
               <tr>
-                <th scope="col" className="px-3 py-2">Name</th>
-                <th scope="col" className="px-3 py-2">Kind</th>
-                <th scope="col" className="px-3 py-2">Status</th>
-                <th scope="col" className="px-3 py-2">Approval</th>
-                <th scope="col" className="px-3 py-2">Cost</th>
-                <th scope="col" className="px-3 py-2">Project</th>
-                {(canApprove || canDelete) && <th scope="col" className="px-3 py-2">Actions</th>}
+                <SortableHeader sortKey="name"     sort={sort} setSort={setSort}>Name</SortableHeader>
+                <SortableHeader sortKey="kind"     sort={sort} setSort={setSort}>Kind</SortableHeader>
+                <SortableHeader sortKey="status"   sort={sort} setSort={setSort}>Status</SortableHeader>
+                <SortableHeader sortKey="approval" sort={sort} setSort={setSort}>Approval</SortableHeader>
+                <SortableHeader sortKey="cost"     sort={sort} setSort={setSort} align="right">Cost</SortableHeader>
+                <SortableHeader sortKey="project"  sort={sort} setSort={setSort}>Project</SortableHeader>
+                {canDelete && <th scope="col" className="px-4 py-2.5 font-semibold">Actions</th>}
               </tr>
             </thead>
             <tbody>
-              {rows.length === 0 && (
-                <tr><td colSpan={canApprove || canDelete ? 7 : 6} className="px-3 py-4 text-gray-500">
+              {sorted.length === 0 && (
+                <tr><td colSpan={canDelete ? 7 : 6} className="px-4 py-5 text-ink-400">
                   No {noun} resources recorded.
                 </td></tr>
               )}
-              {rows.map((e) => {
+              {sorted.map((e) => {
                 const pending = e.approval_status === 'pending';
                 const rejected = e.approval_status === 'rejected';
                 const badge = pending
-                  ? 'bg-amber-100 text-amber-800'
+                  ? 'bg-amber-100 text-amber-700'
                   : rejected
-                    ? 'bg-red-100 text-red-700'
-                    : 'bg-emerald-100 text-emerald-800';
+                    ? 'bg-ember-100 text-ember-700'
+                    : 'bg-jade-100 text-jade-700';
                 const proj = projectById(e.assigned_project_id);
                 return (
-                  <tr key={e.id} className="border-t border-gray-100">
-                    <td className="px-3 py-2">{e.name}</td>
-                    <td className="px-3 py-2">{e.kind}</td>
-                    <td className="px-3 py-2">{e.status}</td>
-                    <td className="px-3 py-2">
-                      <span className={`rounded px-1.5 py-0.5 text-xs ${badge}`}>{e.approval_status}</span>
+                  <tr key={e.id} className="border-t border-line">
+                    <td className="px-4 py-2.5">{e.name}</td>
+                    <td className="px-4 py-2.5">{e.kind}</td>
+                    <td className="px-4 py-2.5">{equipmentStatusLabel(e.status)}</td>
+                    <td className="px-4 py-2.5">
+                      <span className={`rounded px-1.5 py-0.5 text-xs ${badge}`}>{approvalLabel(e.approval_status)}</span>
                     </td>
-                    <td className="px-3 py-2 tabular-nums">
-                      {e.cost != null ? `${e.cost} ${e.currency}` : <span className="text-gray-400">—</span>}
+                    <td className="px-4 py-2.5 text-right tabular-nums">
+                      {e.cost != null ? `${e.cost} ${e.currency}` : <span className="text-ink-300">—</span>}
                     </td>
-                    <td className="px-3 py-2">
+                    <td className="px-4 py-2.5">
                       {proj ? (
                         <Link to={`/projects/${proj.id}`} className="text-brand-700 hover:underline">
                           {proj.name}
                         </Link>
                       ) : (
-                        <span className="text-gray-400">—</span>
+                        <span className="text-ink-300">—</span>
                       )}
                     </td>
-                    {(canApprove || canDelete) && (
-                      <td className="px-3 py-2">
+                    {canDelete && (
+                      <td className="px-4 py-2.5">
                         <div className="flex flex-wrap gap-1">
-                          {canApprove && pending && (
-                            <>
-                              <button
-                                type="button"
-                                onClick={() => void handleApproval(e.id, 'approved')}
-                                className="rounded bg-emerald-600 px-2 py-0.5 text-xs text-white hover:bg-emerald-700"
-                              >
-                                Approve
-                              </button>
-                              <button
-                                type="button"
-                                onClick={() => void handleApproval(e.id, 'rejected')}
-                                className="rounded border border-gray-300 px-2 py-0.5 text-xs hover:bg-gray-50"
-                              >
-                                Reject
-                              </button>
-                            </>
-                          )}
-                          {canDelete && (
-                            <button
-                              type="button"
-                              onClick={() => void handleRemove(e.id)}
-                              className="rounded border border-gray-300 px-2 py-0.5 text-xs hover:bg-gray-50"
-                            >
-                              Remove
-                            </button>
-                          )}
+                          <button
+                            type="button"
+                            onClick={() => void handleRemove(e.id)}
+                            className="rounded border border-line-strong px-2 py-0.5 text-xs hover:bg-surface-2"
+                          >
+                            Remove
+                          </button>
                         </div>
                       </td>
                     )}
@@ -433,7 +464,7 @@ function EquipmentTab({ isTangible }: { isTangible: boolean }) {
       {canCreate && (
         <form
           onSubmit={(e) => void handleCreate(e)}
-          className={`flex flex-wrap items-start gap-2 rounded border border-dashed p-3 ${canSelfRequest ? 'border-amber-300 bg-amber-50' : 'border-gray-300'}`}
+          className={`flex flex-wrap items-start gap-2 rounded border border-dashed p-3 ${canSelfRequest ? 'border-amber-100 bg-amber-50' : 'border-line-strong'}`}
         >
           <input
             required
@@ -445,7 +476,7 @@ function EquipmentTab({ isTangible }: { isTangible: boolean }) {
                 ? `Propose a ${noun} (e.g. ${isTangible ? 'MacBook Pro 14' : 'Figma seat'})…`
                 : `${Noun} name (e.g. ${isTangible ? 'MacBook Pro 14' : 'Figma seat'})`
             }
-            className="min-w-48 flex-[2_1_14rem] rounded border border-gray-300 px-2 py-1.5 text-sm"
+            className="min-w-48 flex-[2_1_14rem] rounded border border-line-strong px-2 py-1.5 text-sm"
           />
           <input
             required
@@ -453,16 +484,16 @@ function EquipmentTab({ isTangible }: { isTangible: boolean }) {
             value={kind}
             onChange={(e) => setKind(e.target.value)}
             placeholder={`kind (free-form — e.g. ${isTangible ? 'laptop, forklift' : 'software_license, certification'})`}
-            className="min-w-40 flex-1 rounded border border-gray-300 px-2 py-1.5 text-sm"
+            className="min-w-40 flex-1 rounded border border-line-strong px-2 py-1.5 text-sm"
             aria-label={`${Noun} kind`}
           />
           <select
             value={status}
             onChange={(e) => setStatus(e.target.value as EquipmentStatus)}
-            className="min-w-32 flex-none rounded border border-gray-300 px-2 py-1.5 text-sm"
+            className="min-w-32 flex-none rounded border border-line-strong px-2 py-1.5 text-sm"
             aria-label={`${Noun} status`}
           >
-            {EQUIPMENT_STATUSES.map((s) => <option key={s} value={s}>{s}</option>)}
+            {EQUIPMENT_STATUSES.map((s) => <option key={s} value={s}>{equipmentStatusLabel(s)}</option>)}
           </select>
           <input
             type="number"
@@ -471,7 +502,7 @@ function EquipmentTab({ isTangible }: { isTangible: boolean }) {
             value={cost}
             onChange={(e) => setCost(e.target.value)}
             placeholder="Cost"
-            className="w-28 flex-none rounded border border-gray-300 px-2 py-1.5 text-sm tabular-nums"
+            className="w-28 flex-none rounded border border-line-strong px-2 py-1.5 text-sm tabular-nums"
             aria-label="Cost"
           />
           <input
@@ -480,7 +511,7 @@ function EquipmentTab({ isTangible }: { isTangible: boolean }) {
             value={currency}
             onChange={(e) => setCurrency(e.target.value)}
             placeholder="USD"
-            className="w-20 flex-none rounded border border-gray-300 px-2 py-1.5 text-sm uppercase"
+            className="w-20 flex-none rounded border border-line-strong px-2 py-1.5 text-sm uppercase"
             aria-label="Currency code"
             title="Three-letter currency code (USD, EUR, …)"
           />

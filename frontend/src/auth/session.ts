@@ -103,21 +103,63 @@ export function getRole(): SessionRole | null {
 }
 
 /**
- * Map the four canonical workshop personas to their seeded roles. Mirrors
- * `backend/_lib/auth.py:_SEED_ROLES` exactly. Anything else collapses to
- * `'viewer'` so unknown logins get the least-privileged UI.
+ * Map the workshop personas and the ACME roster to their seeded roles.
+ * Mirrors `backend/_lib/auth.py:_SEED_ROLES` exactly — keep both in sync
+ * when adding seed accounts in `bin/seed-cognito.sh`. Anything else
+ * collapses to `'viewer'` so unknown logins get the least-privileged UI.
  */
+const SEED_ROLES: Readonly<Record<string, SessionRole>> = {
+  // Legacy workshop personas.
+  'admin@workshop.local': 'admin',
+  'lead@workshop.local': 'team_lead',
+  'member@workshop.local': 'team_member',
+  'viewer@workshop.local': 'viewer',
+  // ACME team leads (10).
+  'olivia.bennett@acme.org': 'team_lead',
+  'marcus.chen@acme.org': 'team_lead',
+  'priya.raman@acme.org': 'team_lead',
+  'jonas.weber@acme.org': 'team_lead',
+  'amelia.foster@acme.org': 'team_lead',
+  'diego.alvarez@acme.org': 'team_lead',
+  'sasha.petrova@acme.org': 'team_lead',
+  'ravi.subramanian@acme.org': 'team_lead',
+  'hannah.klein@acme.org': 'team_lead',
+  'tobias.larsen@acme.org': 'team_lead',
+  // ACME team members (30).
+  'liam.carter@acme.org': 'team_member',
+  'emma.donovan@acme.org': 'team_member',
+  'noah.patel@acme.org': 'team_member',
+  'ava.rodriguez@acme.org': 'team_member',
+  'ethan.nakamura@acme.org': 'team_member',
+  'mia.johansson@acme.org': 'team_member',
+  'lucas.brennan@acme.org': 'team_member',
+  'sophia.mwangi@acme.org': 'team_member',
+  'mason.reilly@acme.org': 'team_member',
+  'isabella.park@acme.org': 'team_member',
+  'logan.whitaker@acme.org': 'team_member',
+  'charlotte.singh@acme.org': 'team_member',
+  'benjamin.holloway@acme.org': 'team_member',
+  'amelia.castillo@acme.org': 'team_member',
+  'elijah.okafor@acme.org': 'team_member',
+  'harper.lindgren@acme.org': 'team_member',
+  'james.underwood@acme.org': 'team_member',
+  'evelyn.tanaka@acme.org': 'team_member',
+  'alexander.boyd@acme.org': 'team_member',
+  'abigail.fischer@acme.org': 'team_member',
+  'daniel.romano@acme.org': 'team_member',
+  'emily.hartman@acme.org': 'team_member',
+  'henry.delacroix@acme.org': 'team_member',
+  'scarlett.novak@acme.org': 'team_member',
+  'sebastian.ortega@acme.org': 'team_member',
+  'lily.karlsson@acme.org': 'team_member',
+  'jackson.ibarra@acme.org': 'team_member',
+  'grace.sullivan@acme.org': 'team_member',
+  'owen.marchetti@acme.org': 'team_member',
+  'zoe.halvorsen@acme.org': 'team_member',
+};
+
 export function roleForEmail(email: string): SessionRole {
-  switch (email.trim().toLowerCase()) {
-    case 'admin@workshop.local':
-      return 'admin';
-    case 'lead@workshop.local':
-      return 'team_lead';
-    case 'member@workshop.local':
-      return 'team_member';
-    default:
-      return 'viewer';
-  }
+  return SEED_ROLES[email.trim().toLowerCase()] ?? 'viewer';
 }
 
 /**
@@ -136,7 +178,8 @@ export function homeForRole(role: SessionRole | null | undefined): string {
     case 'admin':
       return '/admin';
     case 'viewer':
-      return '/reports';
+      // Viewers land in the cinematic showcase mode by default.
+      return '/showcase';
     case 'team_lead':
     case 'team_member':
       return '/dashboard';

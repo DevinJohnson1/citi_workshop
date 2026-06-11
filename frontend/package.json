@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "dev:reset": "node -e \"const{execSync}=require('child_process');for(const p of [3000,3001]){try{const pids=execSync(`lsof -ti:${p}`,{stdio:['ignore','pipe','ignore']}).toString().trim();if(pids){console.log('freeing port',p,'pids:',pids.replace(/\\n/g,','));execSync(`kill -9 ${pids.split('\\n').join(' ')}`)}else{console.log('port',p,'free')}}catch{console.log('port',p,'free')}}\" && vite",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
     "preview": "vite preview",

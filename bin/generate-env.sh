@@ -128,6 +128,19 @@ else
     VITE_REDIRECT_URI="http://localhost:3000/login/callback"
 fi
 
+# Seed-login quick-sign-in shortcut: on LocalStack we want the four persona
+# buttons + prefilled defaults so the dev loop is one click. On AWS we want
+# them OFF — the buttons reveal seeded test emails and the shared
+# Workshop!2026 password. Override per-deployment by exporting
+# VITE_SEED_LOGIN_ENABLED=true|false before running this script.
+if [ -n "${VITE_SEED_LOGIN_ENABLED:-}" ]; then
+    SEED_LOGIN_ENABLED="$VITE_SEED_LOGIN_ENABLED"
+elif [ "$ENVIRONMENT" = "aws" ]; then
+    SEED_LOGIN_ENABLED="false"
+else
+    SEED_LOGIN_ENABLED="true"
+fi
+
 # Generate .env.local configuration file for React frontend
 cat > "$ENVIRONMENT_CONFIG" << EOF
 # Auto-generated environment file
@@ -142,6 +155,7 @@ VITE_COGNITO_DOMAIN=$COGNITO_DOMAIN
 VITE_COGNITO_REDIRECT_URI=$VITE_REDIRECT_URI
 VITE_COGNITO_ENDPOINT=$VITE_COGNITO_ENDPOINT
 VITE_COGNITO_REGION=$VITE_COGNITO_REGION
+VITE_SEED_LOGIN_ENABLED=$SEED_LOGIN_ENABLED
 EOF
 
 echo ""

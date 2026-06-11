@@ -3,6 +3,9 @@ import { Link } from 'react-router-dom';
 import { useApi, ApiError, type ListResponse } from '../services/apiClient';
 import { useRole } from '../auth/useRole';
 import type { Allocation, BudgetCharge, ProjectBudget, User } from '../types/api';
+import { approvalLabel } from '../utils/labels';
+import { SortableHeader } from './ui/SortableHeader';
+import { useSortableTable } from '../utils/useSortableTable';
 import {
   DAILY_RATE,
   HOURLY_RATE_USD,
@@ -129,8 +132,28 @@ export function BudgetPanel({ projectId }: Props) {
     }
   };
 
-  if (loading) return <p className="text-sm text-gray-500">Loading…</p>;
-  if (error) return <p className="text-sm text-red-600">{error}</p>;
+  // Sort hook is declared above the early returns so the hook order stays
+  // stable across renders — calling useSortableTable after a conditional
+  // return would violate React's rules of hooks and surface as "Rendered
+  // more hooks than during the previous render" once the data loads.
+  // Accessors close over `allocations` / `users` / `userAllAllocations`,
+  // all of which are always defined (empty arrays before the fetch).
+  const laborSort = useSortableTable(allocations, {
+    member: (a) => {
+      const u = users.find((x) => x.id === a.user_id);
+      return u ? (u.full_name || u.email) : a.user_id;
+    },
+    role:  (a) => a.role_description ?? '',
+    start: (a) => a.start_date,
+    end:   (a) => a.end_date,
+    cost:  (a) => {
+      const allAllocs = userAllAllocations[a.user_id] ?? [a];
+      return computeLaborCost(a, allAllocs);
+    },
+  }, { key: 'member', dir: 'asc' });
+
+  if (loading) return <p className="text-sm text-ink-400">Loading…</p>;
+  if (error) return <p className="text-sm text-ember-500">{error}</p>;
   if (!budget) return null;
 
   const ceiling = budget.budget_amount;
@@ -147,6 +170,13 @@ export function BudgetPanel({ projectId }: Props) {
   const totalRemaining = ceiling != null ? Number(ceiling) - totalConsumed : null;
 
   const userById = (id: string): User | undefined => users.find((u) => u.id === id);
+
+  // Pre-compute labour cost per allocation so the sort accessor is cheap.
+  const laborCostById: Record<string, number> = {};
+  for (const a of allocations) {
+    const allAllocs = userAllAllocations[a.user_id] ?? [a];
+    laborCostById[a.id] = computeLaborCost(a, allAllocs);
+  }
 
   return (
     <div className="space-y-4">
@@ -209,45 +239,40 @@ export function BudgetPanel({ projectId }: Props) {
       {/* Labor cost breakdown per person */}
       <section className="space-y-1">
         <header className="flex items-baseline justify-between">
-          <h3 className="text-sm font-semibold text-gray-800">People (labor)</h3>
+          <h3 className="text-sm font-semibold text-ink-700">People (labor)</h3>
           {allocations.length > 0 && (
-            <span className="text-xs text-gray-500 tabular-nums">
+            <span className="text-xs text-ink-400 tabular-nums">
               Total: {formatUsd(laborTotal)}
             </span>
           )}
         </header>
-        <div className="overflow-x-auto rounded border border-gray-200 bg-white">
+        <div className="overflow-x-auto rounded border border-line bg-surface">
           <table className="min-w-full text-sm">
-            <thead className="bg-gray-50 text-left text-gray-700">
+            <thead className="bg-surface-2 text-left text-ink-700">
               <tr>
-                <th scope="col" className="px-3 py-2">Member</th>
-                <th scope="col" className="px-3 py-2">Role on project</th>
-                <th scope="col" className="px-3 py-2">Start</th>
-                <th scope="col" className="px-3 py-2">End</th>
-                  <th scope="col" className="px-3 py-2 text-right">
-                    Labor Cost
-                    <span
-                      className="ml-1 cursor-help text-gray-400"
-                      title={`~${formatUsd(DAILY_RATE)}/day ($${HOURLY_RATE_USD}/h × ${HOURS_PER_WEEK} h/week ÷ 7), split by concurrent active projects per day`}
-                      aria-label="Labor cost calculation details"
-                    >
-                      ⓘ
-                    </span>
-                  </th>
+                <SortableHeader sortKey="member" sort={laborSort.sort} setSort={laborSort.setSort}>Member</SortableHeader>
+                <SortableHeader sortKey="role"   sort={laborSort.sort} setSort={laborSort.setSort}>Role on project</SortableHeader>
+                <SortableHeader sortKey="start"  sort={laborSort.sort} setSort={laborSort.setSort}>Start</SortableHeader>
+                <SortableHeader sortKey="end"    sort={laborSort.sort} setSort={laborSort.setSort}>End</SortableHeader>
+                <SortableHeader sortKey="cost"   sort={laborSort.sort} setSort={laborSort.setSort} align="right"
+                  title={`~${formatUsd(DAILY_RATE)}/day ($${HOURLY_RATE_USD}/h × ${HOURS_PER_WEEK} h/week ÷ 7), split by concurrent active projects per day`}
+                >
+                  Labor Cost
+                </SortableHeader>
               </tr>
             </thead>
             <tbody>
-              {allocations.length === 0 && (
+              {laborSort.sorted.length === 0 && (
                 <tr>
-                  <td colSpan={5} className="px-3 py-3 text-gray-500">
+                  <td colSpan={5} className="px-4 py-3 text-ink-400">
                     No approved allocations — assign team members in the Allocations tab.
                   </td>
                 </tr>
               )}
-              {allocations.map((a) => {
+              {laborSort.sorted.map((a) => {
                 const user = userById(a.user_id);
                 const allAllocs = userAllAllocations[a.user_id] ?? [a];
-                const cost = computeLaborCost(a, allAllocs);
+                const cost = laborCostById[a.id] ?? 0;
                 const { min, max } = getConcurrencyStats(a, allAllocs);
                 const concurrencyNote =
                   min === max
@@ -255,16 +280,16 @@ export function BudgetPanel({ projectId }: Props) {
                     : `${min}–${max} concurrent projects depending on the day`;
                 const costNote = `${formatUsd(DAILY_RATE)}/day ÷ concurrent projects — ${concurrencyNote}`;
                 return (
-                  <tr key={a.id} className="border-t border-gray-100">
-                    <td className="px-3 py-2">
+                  <tr key={a.id} className="border-t border-line">
+                    <td className="px-4 py-2.5">
                       {user ? (user.full_name || user.email) : a.user_id}
                     </td>
-                    <td className="px-3 py-2 text-gray-700">
-                      {a.role_description || <span className="text-gray-400">—</span>}
+                    <td className="px-4 py-2.5 text-ink-700">
+                      {a.role_description || <span className="text-ink-300">—</span>}
                     </td>
-                    <td className="px-3 py-2">{a.start_date}</td>
-                    <td className="px-3 py-2">{a.end_date}</td>
-                    <td className="px-3 py-2 text-right tabular-nums" title={costNote}>
+                    <td className="px-4 py-2.5">{a.start_date}</td>
+                    <td className="px-4 py-2.5">{a.end_date}</td>
+                    <td className="px-4 py-2.5 text-right tabular-nums" title={costNote}>
                       {formatUsd(cost)}
                     </td>
                   </tr>
@@ -272,12 +297,12 @@ export function BudgetPanel({ projectId }: Props) {
               })}
             </tbody>
             {allocations.length > 0 && (
-              <tfoot className="border-t-2 border-gray-300 bg-gray-50 font-medium">
+              <tfoot className="border-t-2 border-line-strong bg-surface-2 font-medium">
                 <tr>
-                  <td colSpan={4} className="px-3 py-2 text-right text-gray-600">
+                  <td colSpan={4} className="px-4 py-2.5 text-right text-ink-500">
                     Total labor
                   </td>
-                  <td className="px-3 py-2 text-right tabular-nums text-gray-900">
+                  <td className="px-4 py-2.5 text-right tabular-nums text-ink-900">
                     {formatUsd(laborTotal)}
                   </td>
                 </tr>
@@ -288,7 +313,7 @@ export function BudgetPanel({ projectId }: Props) {
       </section>
 
       {budget.charges.length === 0 && allocations.length === 0 && (
-        <p className="rounded border border-blue-200 bg-blue-50 px-3 py-2 text-xs text-blue-900">
+        <p className="rounded border border-sky-100 bg-sky-50 px-3 py-2 text-xs text-sky-700">
           Add tangibles or intangibles from this project's <strong>Tangibles</strong> or{' '}
           <strong>Intangibles</strong> tab — each item with a recorded cost is drawn
           against this budget on assignment. Assign team members in the{' '}
@@ -303,7 +328,7 @@ export function BudgetPanel({ projectId }: Props) {
       {canEdit && (
         <form
           onSubmit={(e) => void handleSave(e)}
-          className="flex flex-wrap items-start gap-2 rounded border border-dashed border-gray-300 p-3"
+          className="flex flex-wrap items-start gap-2 rounded border border-dashed border-line-strong p-3"
         >
           <input
             type="number"
@@ -312,7 +337,7 @@ export function BudgetPanel({ projectId }: Props) {
             value={amountDraft}
             onChange={(e) => setAmountDraft(e.target.value)}
             placeholder="Budget ceiling (blank = no limit)"
-            className="min-w-48 flex-1 rounded border border-gray-300 px-2 py-1.5 text-sm tabular-nums"
+            className="min-w-48 flex-1 rounded border border-line-strong px-2 py-1.5 text-sm tabular-nums"
             aria-label="Budget ceiling"
           />
           <input
@@ -321,7 +346,7 @@ export function BudgetPanel({ projectId }: Props) {
             value={currencyDraft}
             onChange={(e) => setCurrencyDraft(e.target.value)}
             placeholder="USD"
-            className="w-20 flex-none rounded border border-gray-300 px-2 py-1.5 text-sm uppercase"
+            className="w-20 flex-none rounded border border-line-strong px-2 py-1.5 text-sm uppercase"
             aria-label="Currency code"
             title="Three-letter currency code (USD, EUR, …)"
           />
@@ -356,17 +381,17 @@ function SummaryCard({
   hint?: string;
 }) {
   const toneClass: Record<Tone, string> = {
-    neutral: 'border-gray-200 bg-white',
-    good: 'border-emerald-200 bg-emerald-50',
-    warn: 'border-amber-200 bg-amber-50',
-    danger: 'border-red-200 bg-red-50',
-    muted: 'border-gray-200 bg-gray-50 text-gray-500',
+    neutral: 'border-line bg-surface',
+    good: 'border-jade-100 bg-jade-50',
+    warn: 'border-amber-100 bg-amber-50',
+    danger: 'border-ember-100 bg-ember-50',
+    muted: 'border-line bg-surface-2 text-ink-400',
   };
   return (
     <div className={`rounded border px-3 py-2 ${toneClass[tone]}`} title={hint}>
-      <div className="text-xs uppercase tracking-wide text-gray-500">{label}</div>
+      <div className="text-xs uppercase tracking-wide text-ink-400">{label}</div>
       <div className="mt-0.5 text-base font-semibold tabular-nums">{value}</div>
-      {hint && <div className="mt-0.5 truncate text-xs text-gray-400">{hint}</div>}
+      {hint && <div className="mt-0.5 truncate text-xs text-ink-300">{hint}</div>}
     </div>
   );
 }
@@ -393,40 +418,46 @@ function ChargesTable({
   // projects aren't supported by the budget gate either, so this matches the
   // backend's implicit assumption (project.budget_currency wins).
   const currency = rows[0]?.currency ?? '';
+  const { sorted, sort, setSort } = useSortableTable(rows, {
+    name:     (c) => c.name,
+    kind:     (c) => c.kind,
+    approval: (c) => c.approval_status,
+    cost:     (c) => c.cost ?? -1,
+  }, { key: 'name', dir: 'asc' });
   return (
     <section className="space-y-1">
       <header className="flex items-baseline justify-between">
-        <h3 className="text-sm font-semibold text-gray-800">{title}</h3>
+        <h3 className="text-sm font-semibold text-ink-700">{title}</h3>
         {rows.length > 0 && (
-          <span className="text-xs text-gray-500 tabular-nums">
+          <span className="text-xs text-ink-400 tabular-nums">
             Subtotal: {subtotal.toFixed(2)} {currency}
           </span>
         )}
       </header>
-      <div className="overflow-x-auto rounded border border-gray-200 bg-white">
+      <div className="overflow-x-auto rounded border border-line bg-surface">
         <table className="min-w-full text-sm">
-          <thead className="bg-gray-50 text-left text-gray-700">
+          <thead className="bg-surface-2 text-left text-ink-700">
             <tr>
-              <th scope="col" className="px-3 py-2">Item</th>
-              <th scope="col" className="px-3 py-2">Kind</th>
-              <th scope="col" className="px-3 py-2">Approval</th>
-              <th scope="col" className="px-3 py-2 text-right">Cost</th>
+              <SortableHeader sortKey="name"     sort={sort} setSort={setSort}>Item</SortableHeader>
+              <SortableHeader sortKey="kind"     sort={sort} setSort={setSort}>Kind</SortableHeader>
+              <SortableHeader sortKey="approval" sort={sort} setSort={setSort}>Approval</SortableHeader>
+              <SortableHeader sortKey="cost"     sort={sort} setSort={setSort} align="right">Cost</SortableHeader>
             </tr>
           </thead>
           <tbody>
-            {rows.length === 0 && (
+            {sorted.length === 0 && (
               <tr>
-                <td colSpan={4} className="px-3 py-3 text-gray-500">
+                <td colSpan={4} className="px-4 py-3 text-ink-400">
                   {emptyHint}
                 </td>
               </tr>
             )}
-            {rows.map((c) => (
-              <tr key={c.id} className="border-t border-gray-100">
-                <td className="px-3 py-2">{c.name}</td>
-                <td className="px-3 py-2">{c.kind}</td>
-                <td className="px-3 py-2">{c.approval_status}</td>
-                <td className="px-3 py-2 text-right tabular-nums">
+            {sorted.map((c) => (
+              <tr key={c.id} className="border-t border-line">
+                <td className="px-4 py-2.5">{c.name}</td>
+                <td className="px-4 py-2.5">{c.kind}</td>
+                <td className="px-4 py-2.5">{approvalLabel(c.approval_status)}</td>
+                <td className="px-4 py-2.5 text-right tabular-nums">
                   {c.cost != null ? `${c.cost} ${c.currency}` : '—'}
                 </td>
               </tr>
@@ -437,19 +468,5 @@ function ChargesTable({
     </section>
   );
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 

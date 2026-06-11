@@ -1,7 +1,9 @@
 import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useApi, ApiError, type ListResponse } from '../services/apiClient';
+import { useRole } from '../auth/useRole';
 import type { Project, ProjectStatus, User } from '../types/api';
+import { prettyLabel } from '../utils/labels';
 
 const STATUSES: ProjectStatus[] = ['planned', 'active', 'on_hold', 'done', 'cancelled'];
 
@@ -14,6 +16,12 @@ const STATUSES: ProjectStatus[] = ['planned', 'active', 'on_hold', 'done', 'canc
 export function ProjectCreatePage() {
   const { apiGet, apiPost } = useApi();
   const navigate = useNavigate();
+  const role = useRole();
+  // Team leads run their own projects — the backend auto-assigns the
+  // creator as owner when `owner_id` is omitted, so we hide the picker.
+  // Admins still see the dropdown because they are commonly setting up
+  // projects on behalf of a lead.
+  const showOwnerPicker = role === 'admin';
 
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
@@ -31,11 +39,12 @@ export function ProjectCreatePage() {
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
+    if (!showOwnerPicker) return;
     // Owner dropdown lists team_leads only. Filter is client-side.
     apiGet<ListResponse<User>>('/resources-service')
       .then((res) => setOwners(res.data.filter((u) => u.role === 'team_lead')))
       .catch((err: Error) => setError(err.message));
-  }, [apiGet]);
+  }, [apiGet, showOwnerPicker]);
 
   /** Submit the form and bounce to the new project's detail page on success. */
   const handleSubmit = async (event: React.FormEvent<HTMLFormElement>): Promise<void> => {
@@ -65,7 +74,7 @@ export function ProjectCreatePage() {
     <section className="mx-auto max-w-2xl space-y-4">
       <header>
         <h1 className="text-xl font-semibold">New project</h1>
-        <p className="text-sm text-gray-600">
+        <p className="text-sm text-ink-500">
           As a team lead you own the project shell, including its singular
           budget ceiling. Members can then create deliverables and propose
           equipment (tangibles / intangibles) inside it for your approval —
@@ -73,73 +82,83 @@ export function ProjectCreatePage() {
         </p>
       </header>
 
-      <form onSubmit={(e) => void handleSubmit(e)} className="space-y-4 rounded border border-gray-200 bg-white p-4">
+      <form onSubmit={(e) => void handleSubmit(e)} className="space-y-4 rounded border border-line bg-surface p-4">
         <label className="block text-sm">
-          <span className="text-gray-700">Name</span>
+          <span className="text-ink-700">Name</span>
           <input
             required
             maxLength={200}
             value={name}
             onChange={(e) => setName(e.target.value)}
-            className="mt-1 block w-full rounded border border-gray-300 px-2 py-1.5"
+            className="mt-1 block w-full rounded border border-line-strong px-2 py-1.5"
           />
         </label>
         <label className="block text-sm">
-          <span className="text-gray-700">Description</span>
+          <span className="text-ink-700">Description</span>
           <textarea
             rows={3}
             value={description}
             onChange={(e) => setDescription(e.target.value)}
-            className="mt-1 block w-full rounded border border-gray-300 px-2 py-1.5"
+            className="mt-1 block w-full rounded border border-line-strong px-2 py-1.5"
           />
-        </label>
-        <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+        </label>        <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
           <label className="text-sm">
-            <span className="text-gray-700">Status</span>
+            <span className="text-ink-700">Status</span>
             <select
               value={status}
               onChange={(e) => setStatus(e.target.value as ProjectStatus)}
-              className="mt-1 block w-full rounded border border-gray-300 px-2 py-1.5"
+              className="mt-1 block w-full rounded border border-line-strong px-2 py-1.5"
             >
               {STATUSES.map((s) => (
-                <option key={s} value={s}>{s}</option>
+                <option key={s} value={s}>{prettyLabel(s)}</option>
               ))}
             </select>
           </label>
           <label className="text-sm">
-            <span className="text-gray-700">Start date</span>
+            <span className="text-ink-700">Start date</span>
             <input
               type="date"
               value={startDate}
               onChange={(e) => setStartDate(e.target.value)}
-              className="mt-1 block w-full rounded border border-gray-300 px-2 py-1.5"
+              className="mt-1 block w-full rounded border border-line-strong px-2 py-1.5"
             />
           </label>
           <label className="text-sm">
-            <span className="text-gray-700">Target end</span>
+            <span className="text-ink-700">Target end</span>
             <input
               type="date"
               value={targetEndDate}
               onChange={(e) => setTargetEndDate(e.target.value)}
-              className="mt-1 block w-full rounded border border-gray-300 px-2 py-1.5"
+              className="mt-1 block w-full rounded border border-line-strong px-2 py-1.5"
             />
           </label>
         </div>
-        <label className="block text-sm">
-          <span className="text-gray-700">Owner (team lead)</span>
-          <select
-            value={ownerId}
-            onChange={(e) => setOwnerId(e.target.value)}
-            className="mt-1 block w-full rounded border border-gray-300 px-2 py-1.5"
-          >
-            <option value="">— pick a team lead —</option>
-            {owners.map((u) => (
-              <option key={u.id} value={u.id}>
-                {u.full_name || u.email}
-              </option>
-            ))}
-          </select>
-        </label>
+        {showOwnerPicker && (
+          <label className="block text-sm">
+            <span className="text-ink-700">Owner (team lead)</span>
+            <select
+              value={ownerId}
+              onChange={(e) => setOwnerId(e.target.value)}
+              className="mt-1 block w-full rounded border border-line-strong px-2 py-1.5"
+            >
+              <option value="">— pick a team lead —</option>
+              {owners.map((u) => (
+                <option key={u.id} value={u.id}>
+                  {u.full_name || u.email}
+                </option>
+              ))}
+            </select>
+          </label>
+        )}
+        {!showOwnerPicker && (
+          // Team leads always own the projects they create — the backend
+          // fills in `owner_id = caller` when the field is omitted. Surface
+          // this so the lead isn't surprised by the missing control.
+          <p className="text-xs text-ink-500">
+            You will be set as the owner of this project. You can transfer
+            ownership later from the project page.
+          </p>
+        )}
 
         {/* Budget — singular ceiling for the whole project. Tangibles and
             intangibles attached later (from the project's Resources panel,
@@ -148,7 +167,7 @@ export function ProjectCreatePage() {
             budget gate is then disabled for this project. */}
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-[1fr,100px]">
           <label className="text-sm">
-            <span className="text-gray-700">Budget ceiling (optional)</span>
+            <span className="text-ink-700">Budget ceiling (optional)</span>
             <input
               type="number"
               min={0}
@@ -156,17 +175,17 @@ export function ProjectCreatePage() {
               value={budgetAmount}
               onChange={(e) => setBudgetAmount(e.target.value)}
               placeholder="Blank = no limit"
-              className="mt-1 block w-full rounded border border-gray-300 px-2 py-1.5 tabular-nums"
+              className="mt-1 block w-full rounded border border-line-strong px-2 py-1.5 tabular-nums"
             />
           </label>
           <label className="text-sm">
-            <span className="text-gray-700">Currency</span>
+            <span className="text-ink-700">Currency</span>
             <input
               type="text"
               maxLength={3}
               value={budgetCurrency}
               onChange={(e) => setBudgetCurrency(e.target.value)}
-              className="mt-1 block w-full rounded border border-gray-300 px-2 py-1.5 uppercase"
+              className="mt-1 block w-full rounded border border-line-strong px-2 py-1.5 uppercase"
               aria-label="Currency code"
               title="Three-letter currency code (USD, EUR, …)"
             />
@@ -174,7 +193,7 @@ export function ProjectCreatePage() {
         </div>
 
         {error && (
-          <div role="alert" className="rounded border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+          <div role="alert" className="rounded border border-ember-100 bg-ember-50 px-3 py-2 text-sm text-ember-700">
             {error}
           </div>
         )}
@@ -190,7 +209,7 @@ export function ProjectCreatePage() {
           <button
             type="button"
             onClick={() => navigate('/projects')}
-            className="rounded border border-gray-300 px-3 py-1.5 text-sm hover:bg-gray-50"
+            className="rounded border border-line-strong px-3 py-1.5 text-sm hover:bg-surface-2"
           >
             Cancel
           </button>

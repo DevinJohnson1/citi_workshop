@@ -28,6 +28,7 @@ from pydantic import Field, ValidationError
 
 from _lib import db, http
 from _lib.auth import AuthError, current_user, handle_auth_errors, verify_token
+from _lib.projects import is_project_lead
 from _lib.validation import StrictModel, first_error
 
 _LOG = logging.getLogger()
@@ -133,11 +134,17 @@ def _budget_payload(project: dict[str, Any], charges: list[dict[str, Any]]) -> d
     }
 
 
-def _require_owner_or_admin(user: Mapping[str, Any], owner_id: str) -> None:
-    """Match projects-service: admin OR the owning team_lead may write."""
+def _require_owner_or_admin(
+    user: Mapping[str, Any], project_id: str
+) -> None:
+    """Match projects-service: admin OR any project lead (owner / co-lead).
+
+    A ``team_lead`` listed in ``project_leads`` for this project gets the
+    same write authority as the canonical owner — see ``_lib/projects``.
+    """
     if user["role"] == "admin":
         return
-    if user["role"] == "team_lead" and owner_id == user["id"]:
+    if user["role"] == "team_lead" and is_project_lead(db.get_conn(), project_id, user["id"]):
         return
     raise AuthError(403, "Insufficient role")
 
@@ -164,7 +171,7 @@ def _upsert_budget(event: Mapping[str, Any]) -> dict[str, Any]:
     project = _project(conn, body.project_id)
     if project is None:
         return http.not_found("Project not found", event)
-    _require_owner_or_admin(user, project["owner_id"])
+    _require_owner_or_admin(user, body.project_id)
 
     # Refuse to lower the ceiling below what's already committed to assigned
     # equipment — otherwise existing tangibles would be silently underwater.

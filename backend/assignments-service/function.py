@@ -1,9 +1,13 @@
 """assignments-service — many-to-many between ``deliverables`` and ``users``.
 
 Same row shape for team leads and team members; ``role_on_assignment``
-differentiates ``owner`` / ``contributor`` / ``reviewer``. Only users whose
-``users.role = 'team_lead'`` may hold ``role_on_assignment = 'owner'`` —
-enforced here.
+differentiates ``owner`` / ``contributor`` / ``reviewer``. All three
+assignment roles — including ``owner`` — are open to any user (lead or
+member) who already holds an approved allocation on the deliverable's
+project. The capacity gate in ``_create`` enforces the allocation
+prerequisite; ``users.role`` is intentionally *not* consulted when picking
+an assignment role, because owning your own deliverable is the common
+case for a team_member.
 """
 
 from __future__ import annotations
@@ -16,6 +20,7 @@ from pydantic import Field, ValidationError
 
 from _lib import db, http
 from _lib.auth import AuthError, current_user, handle_auth_errors, verify_token
+from _lib.projects import is_project_lead
 from _lib.validation import AssignmentRole, StrictModel, first_error
 
 _LOG = logging.getLogger()
@@ -116,15 +121,35 @@ def _get(event: Mapping[str, Any], assignment_id: str) -> dict[str, Any]:
     return http.ok(row, event)
 
 
-def _owning_lead_for_deliverable(conn, deliverable_id: str) -> str | None:
+def _owning_lead_for_deliverable(conn, deliverable_id: str) -> tuple[str, str] | None:
+    """Return (owner_id, project_id) for the deliverable's project, or None."""
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT p.owner_id FROM deliverables d JOIN projects p ON p.id = d.project_id "
+            "SELECT p.owner_id, p.id AS project_id "
+            "FROM deliverables d JOIN projects p ON p.id = d.project_id "
             "WHERE d.id = %s",
             (deliverable_id,),
         )
         row = cur.fetchone()
-    return row["owner_id"] if row else None
+    return (row["owner_id"], row["project_id"]) if row else None
+
+
+def _has_approved_allocation(conn, user_id: str, project_id: str) -> bool:
+    """True iff ``user_id`` holds an *approved* allocation on ``project_id``.
+
+    The "you must be on the project before you can be on its deliverables"
+    rule is enforced here so the deliverable-level assignment surface can
+    never reach beyond the project's staffed roster. Pending / rejected
+    allocations do not count — only confirmed capacity.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT 1 FROM allocations "
+            "WHERE user_id = %s AND project_id = %s AND approval_status = 'approved' "
+            "LIMIT 1",
+            (user_id, project_id),
+        )
+        return cur.fetchone() is not None
 
 
 def _create(event: Mapping[str, Any]) -> dict[str, Any]:
@@ -132,19 +157,34 @@ def _create(event: Mapping[str, Any]) -> dict[str, Any]:
     body = AssignmentCreate(**http.parse_json_body(event))
 
     conn = db.get_conn()
-    owner = _owning_lead_for_deliverable(conn, body.deliverable_id)
-    if owner is None:
+    project_info = _owning_lead_for_deliverable(conn, body.deliverable_id)
+    if project_info is None:
         return http.not_found("Deliverable not found", event)
-    if user["role"] != "admin" and not (user["role"] == "team_lead" and owner == user["id"]):
+    owner, project_id = project_info
+    # Owner OR any co-lead may write — see _lib/projects.is_project_lead.
+    if user["role"] != "admin" and not (
+        user["role"] == "team_lead" and is_project_lead(conn, project_id, user["id"])
+    ):
         raise AuthError(403, "Insufficient role")
 
-    # Only team_lead users may be assigned as 'owner'.
-    if body.role_on_assignment == "owner":
-        with conn.cursor() as cur:
-            cur.execute("SELECT role FROM users WHERE id = %s", (body.user_id,))
-            target = cur.fetchone()
-        if not target or target["role"] != "team_lead":
-            raise AuthError(403, "Only team_lead users may hold role_on_assignment='owner'")
+    # Capacity gate: the assignee must already be allocated to the owning
+    # project (approved status). Without this, leads could pull arbitrary
+    # users onto deliverables without ever committing them to the project's
+    # staffing plan — defeating the over-allocation report and the
+    # allocation-approval workflow.
+    if not _has_approved_allocation(conn, body.user_id, project_id):
+        raise ValueError(
+            "user_id: must hold an approved allocation on this deliverable's "
+            "project before being assigned. Add the allocation first via "
+            "/allocations-service."
+        )
+
+    # Any of the three assignment roles ('owner' / 'contributor' / 'reviewer')
+    # is allowed for any allocated user, regardless of users.role. Owning your
+    # own deliverable is the common case for a team_member; leads typically
+    # take 'reviewer' but the schema does not forbid them taking 'owner'
+    # either. The earlier "owner ⇒ users.role = 'team_lead'" gate was removed
+    # because it conflicted with how teams actually run deliverables.
 
     with db.transaction() as conn, conn.cursor() as cur:
         cur.execute(
@@ -172,7 +212,7 @@ def _patch(event: Mapping[str, Any], assignment_id: str) -> dict[str, Any]:
     conn = db.get_conn()
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT a.*, p.owner_id FROM assignments a "
+            "SELECT a.*, p.owner_id, p.id AS project_id FROM assignments a "
             "JOIN deliverables d ON d.id = a.deliverable_id "
             "JOIN projects p ON p.id = d.project_id WHERE a.id = %s",
             (assignment_id,),
@@ -184,7 +224,10 @@ def _patch(event: Mapping[str, Any], assignment_id: str) -> dict[str, Any]:
     # Assignee may only touch accepted_at / completed_at.
     assignee_only = {"accepted_at", "completed_at"}
     is_assignee = existing["user_id"] == user["id"]
-    is_lead = user["role"] == "admin" or (user["role"] == "team_lead" and existing["owner_id"] == user["id"])
+    is_lead = user["role"] == "admin" or (
+        user["role"] == "team_lead"
+        and is_project_lead(conn, existing["project_id"], user["id"])
+    )
     if is_assignee and not is_lead and not set(fields).issubset(assignee_only):
         raise AuthError(403, "Assignees may only update accepted_at / completed_at")
     if not is_assignee and not is_lead:
@@ -207,7 +250,7 @@ def _delete(event: Mapping[str, Any], assignment_id: str) -> dict[str, Any]:
     conn = db.get_conn()
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT p.owner_id FROM assignments a "
+            "SELECT p.owner_id, p.id AS project_id FROM assignments a "
             "JOIN deliverables d ON d.id = a.deliverable_id "
             "JOIN projects p ON p.id = d.project_id WHERE a.id = %s",
             (assignment_id,),
@@ -215,7 +258,10 @@ def _delete(event: Mapping[str, Any], assignment_id: str) -> dict[str, Any]:
         existing = cur.fetchone()
     if not existing:
         return http.not_found(event=event)
-    if user["role"] != "admin" and not (user["role"] == "team_lead" and existing["owner_id"] == user["id"]):
+    if user["role"] != "admin" and not (
+        user["role"] == "team_lead"
+        and is_project_lead(conn, existing["project_id"], user["id"])
+    ):
         raise AuthError(403, "Insufficient role")
     with db.transaction() as conn, conn.cursor() as cur:
         cur.execute("DELETE FROM assignments WHERE id = %s", (assignment_id,))

@@ -14,7 +14,7 @@ export function OverworkBadge({ user }: { user: User }) {
   const deliverables = user.active_deliverable_count ?? 0;
   return (
     <span
-      className="ml-1 inline-flex items-center gap-0.5 rounded bg-red-100 px-1.5 py-0.5 text-xs font-medium text-red-800"
+      className="ml-1 inline-flex items-center gap-0.5 rounded-md bg-ember-50 px-1.5 py-0.5 text-[11px] font-semibold text-ember-700 ring-1 ring-inset ring-ember-100"
       title={`Overworked: ${projects} active project${projects === 1 ? '' : 's'}, ${deliverables} open deliverable${deliverables === 1 ? '' : 's'}`}
     >
       ⚠ overworked

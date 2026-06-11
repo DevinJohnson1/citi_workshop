@@ -12,6 +12,9 @@ import {
   formatUsd,
 } from '../utils/laborCost';
 import { overworkSuffix } from './OverworkBadge';
+import { approvalLabel, roleLabel } from '../utils/labels';
+import { SortableHeader } from './ui/SortableHeader';
+import { useSortableTable } from '../utils/useSortableTable';
 
 /**
  * Props for {@link AllocationsPanel}.
@@ -19,6 +22,16 @@ import { overworkSuffix } from './OverworkBadge';
 interface Props {
   /** The project whose allocations are displayed and managed. */
   projectId: string;
+  /** Owner of the project — non-owning leads can only self-request. */
+  ownerId: string;
+  /**
+   * Full set of project lead ids (owner + co-leads). Any user in this list
+   * with the `team_lead` role gets the same write authority as the owner —
+   * mirrors backend `_lib/projects.is_project_lead`. Optional for backwards
+   * compatibility with payloads predating the `project_leads` table; when
+   * omitted, falls back to `[ownerId]`.
+   */
+  leadIds?: string[];
 }
 
 /**
@@ -40,18 +53,37 @@ interface Props {
  * across all projects, this project is charged 1/N of the daily rate for that
  * day.  Days worked exclusively on this project carry the full daily rate.
  */
-export function AllocationsPanel({ projectId }: Props) {
+export function AllocationsPanel({ projectId, ownerId, leadIds }: Props) {
   const { apiGet, apiPost, apiPatch, apiDelete } = useApi();
   const role = useRole();
   const me = useCurrentUser();
-  const canAssign = role === 'team_lead' || role === 'admin';
+  const isAdmin = role === 'admin';
+  // "Owning lead" = any project lead (canonical owner or co-lead). Co-leads
+  // get identical write authority — see backend _lib/projects.
+  const effectiveLeadIds = leadIds && leadIds.length > 0 ? leadIds : [ownerId];
+  const isOwningLead = role === 'team_lead' && me !== null && effectiveLeadIds.includes(me.id);
+  // Only admin or the owning lead may allocate *other people*. Non-owning
+  // leads (and team members) can self-request — they may join the project
+  // themselves as a pending allocation that the owning lead must approve.
+  const canAssign = isAdmin || isOwningLead;
   const canApprove = canAssign;
-  const canSelfRequest = role === 'team_member';
 
   const [allocations, setAllocations] = useState<Allocation[]>([]);
   const [users, setUsers] = useState<User[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+
+  // Anyone who isn't an admin/owning lead and who doesn't already have an
+  // allocation on the project may submit a self-request. Once they have any
+  // allocation here (pending, approved, or even rejected) the form hides —
+  // they can withdraw a pending row and try again instead of stacking
+  // duplicate requests.
+  const hasOwnAllocation =
+    me !== null && allocations.some((a) => a.user_id === me.id);
+  const canSelfRequest =
+    !canAssign &&
+    !hasOwnAllocation &&
+    (role === 'team_member' || role === 'team_lead');
 
   /**
    * Map of user_id → all approved allocations for that user across every
@@ -173,49 +205,69 @@ export function AllocationsPanel({ projectId }: Props) {
       return sum + computeLaborCost(a, allAllocs);
     }, 0);
 
+  // Pre-compute labor cost per allocation so the sort accessor stays cheap
+  // and we can reuse the value when rendering the cell.
+  const laborCostById: Record<string, number> = {};
+  for (const a of allocations) {
+    const allAllocs = userAllAllocations[a.user_id] ?? [a];
+    laborCostById[a.id] = computeLaborCost(a, allAllocs);
+  }
+  const userLabel = (id: string): string => {
+    const u = userById(id);
+    return u ? (u.full_name || u.email) : id;
+  };
+
+  const { sorted, sort, setSort } = useSortableTable(allocations, {
+    member: (a) => userLabel(a.user_id),
+    role:   (a) => a.role_description ?? '',
+    start:  (a) => a.start_date,
+    end:    (a) => a.end_date,
+    status: (a) => a.approval_status,
+    cost:   (a) => laborCostById[a.id] ?? 0,
+  }, { key: 'member', dir: 'asc' });
+
   return (
     <div className="space-y-4">
-      {error && <p className="text-sm text-red-600">{error}</p>}
+      {error && <p className="text-sm text-ember-500">{error}</p>}
       {loading ? (
-        <p className="text-sm text-gray-500">Loading…</p>
+        <p className="text-sm text-ink-400">Loading…</p>
       ) : (
-        <table className="min-w-full text-sm">
-          <thead className="bg-gray-50 text-left text-gray-700">
+        // Horizontal scroll wrapper so the rightmost columns (Status / Labor
+        // cost) don't break out of the card on narrow viewports — matches
+        // BudgetPanel / DeliverablesPanel / ProjectEquipmentPanel.
+        <div className="overflow-x-auto rounded border border-line bg-surface">
+          <table className="min-w-full text-sm">
+          <thead className="bg-surface-2 text-left text-ink-700">
             <tr>
-              <th scope="col" className="px-3 py-2">Member</th>
-              <th scope="col" className="px-3 py-2">Role on project</th>
-              <th scope="col" className="px-3 py-2">Start</th>
-              <th scope="col" className="px-3 py-2">End</th>
-              <th scope="col" className="px-3 py-2">Status</th>
-              <th scope="col" className="px-3 py-2 text-right">
+              <SortableHeader sortKey="member" sort={sort} setSort={setSort}>Member</SortableHeader>
+              <SortableHeader sortKey="role"   sort={sort} setSort={setSort}>Role on project</SortableHeader>
+              <SortableHeader sortKey="start"  sort={sort} setSort={setSort}>Start</SortableHeader>
+              <SortableHeader sortKey="end"    sort={sort} setSort={setSort}>End</SortableHeader>
+              <SortableHeader sortKey="status" sort={sort} setSort={setSort}>Status</SortableHeader>
+              <SortableHeader sortKey="cost"   sort={sort} setSort={setSort} align="right"
+                title={`~${formatUsd(DAILY_RATE)}/day ($${HOURLY_RATE_USD}/h × ${HOURS_PER_WEEK} h/week ÷ 7), split by concurrent active projects per day`}
+              >
                 Labor Cost
-                <span
-                  className="ml-1 cursor-help text-gray-400"
-                  title={`~${formatUsd(DAILY_RATE)}/day ($${HOURLY_RATE_USD}/h × ${HOURS_PER_WEEK} h/week ÷ 7), split by concurrent active projects per day`}
-                  aria-label="Labor cost calculation details"
-                >
-                  ⓘ
-                </span>
-              </th>
-              <th scope="col" className="px-3 py-2">Actions</th>
+              </SortableHeader>
+              <th scope="col" className="px-4 py-2.5 font-semibold">Actions</th>
             </tr>
           </thead>
           <tbody>
-            {allocations.length === 0 && (
-              <tr><td colSpan={7} className="px-3 py-4 text-gray-500">No allocations yet.</td></tr>
+            {sorted.length === 0 && (
+              <tr><td colSpan={7} className="px-4 py-5 text-ink-400">No allocations yet.</td></tr>
             )}
-            {allocations.map((a) => {
+            {sorted.map((a) => {
               const user = userById(a.user_id);
               const pending = a.approval_status === 'pending';
               const rejected = a.approval_status === 'rejected';
               const badgeClass = pending
-                ? 'bg-amber-100 text-amber-800'
+                ? 'bg-amber-100 text-amber-700'
                 : rejected
-                  ? 'bg-red-100 text-red-700'
-                  : 'bg-emerald-100 text-emerald-800';
+                  ? 'bg-ember-100 text-ember-700'
+                  : 'bg-jade-100 text-jade-700';
 
               const allAllocs = userAllAllocations[a.user_id] ?? [a];
-              const laborCost = computeLaborCost(a, allAllocs);
+              const laborCost = laborCostById[a.id] ?? 0;
               const { min, max } = getConcurrencyStats(a, allAllocs);
               const concurrencyNote =
                 min === max
@@ -224,42 +276,42 @@ export function AllocationsPanel({ projectId }: Props) {
               const costNote = `${formatUsd(DAILY_RATE)}/day ÷ concurrent projects — ${concurrencyNote}`;
 
               return (
-                <tr key={a.id} className="border-t border-gray-100">
-                  <td className="px-3 py-2">{user ? (user.full_name || user.email) : a.user_id}</td>
-                  <td className="px-3 py-2 text-gray-700">
-                    {a.role_description || <span className="text-gray-400">—</span>}
+                <tr key={a.id} className="border-t border-line">
+                  <td className="px-4 py-2.5">{user ? (user.full_name || user.email) : a.user_id}</td>
+                  <td className="px-4 py-2.5 text-ink-700">
+                    {a.role_description || <span className="text-ink-300">—</span>}
                   </td>
-                  <td className="px-3 py-2">{a.start_date}</td>
-                  <td className="px-3 py-2">{a.end_date}</td>
-                  <td className="px-3 py-2">
+                  <td className="px-4 py-2.5">{a.start_date}</td>
+                  <td className="px-4 py-2.5">{a.end_date}</td>
+                  <td className="px-4 py-2.5">
                     <span className={`rounded px-1.5 py-0.5 text-xs ${badgeClass}`}>
-                      {a.approval_status}
+                      {approvalLabel(a.approval_status)}
                     </span>
                   </td>
                   <td
-                    className={`px-3 py-2 text-right tabular-nums ${pending || rejected ? 'text-gray-400' : 'text-gray-900'}`}
+                    className={`px-4 py-2.5 text-right tabular-nums ${pending || rejected ? 'text-ink-300' : 'text-ink-900'}`}
                     title={costNote}
                   >
                     {formatUsd(laborCost)}
                     {(pending || rejected) && (
-                      <span className="ml-1 text-xs text-gray-400">({a.approval_status})</span>
+                      <span className="ml-1 text-xs text-ink-300">({approvalLabel(a.approval_status).toLowerCase()})</span>
                     )}
                   </td>
-                  <td className="px-3 py-2">
+                  <td className="px-4 py-2.5">
                     <div className="flex flex-wrap gap-1">
                       {canApprove && pending && (
                         <>
                           <button
                             type="button"
                             onClick={() => void handleApproval(a.id, 'approved')}
-                            className="rounded bg-emerald-600 px-2 py-0.5 text-xs text-white hover:bg-emerald-700"
+                            className="rounded bg-jade-500 px-2 py-0.5 text-xs text-white hover:bg-jade-700"
                           >
                             Approve
                           </button>
                           <button
                             type="button"
                             onClick={() => void handleApproval(a.id, 'rejected')}
-                            className="rounded border border-gray-300 px-2 py-0.5 text-xs hover:bg-gray-50"
+                            className="rounded border border-line-strong px-2 py-0.5 text-xs hover:bg-surface-2"
                           >
                             Reject
                           </button>
@@ -269,7 +321,7 @@ export function AllocationsPanel({ projectId }: Props) {
                         <button
                           type="button"
                           onClick={() => void handleRemove(a.id)}
-                          className="rounded border border-gray-300 px-2 py-0.5 text-xs hover:bg-gray-50"
+                          className="rounded border border-line-strong px-2 py-0.5 text-xs hover:bg-surface-2"
                         >
                           {canAssign ? 'Remove' : 'Withdraw'}
                         </button>
@@ -281,12 +333,12 @@ export function AllocationsPanel({ projectId }: Props) {
             })}
           </tbody>
           {allocations.length > 0 && (
-            <tfoot className="border-t-2 border-gray-300 bg-gray-50 font-medium">
+            <tfoot className="border-t-2 border-line-strong bg-surface-2 font-medium">
               <tr>
-                <td colSpan={5} className="px-3 py-2 text-right text-gray-600">
+                <td colSpan={5} className="px-4 py-2.5 text-right text-ink-500">
                   Total approved labor cost
                 </td>
-                <td className="px-3 py-2 text-right tabular-nums text-gray-900">
+                <td className="px-4 py-2.5 text-right tabular-nums text-ink-900">
                   {formatUsd(totalApprovedLaborCost)}
                 </td>
                 <td />
@@ -294,23 +346,24 @@ export function AllocationsPanel({ projectId }: Props) {
             </tfoot>
           )}
         </table>
+        </div>
       )}
 
       {canAssign && (
         <form
           onSubmit={(e) => void handleAssign(e)}
-          className="grid grid-cols-1 gap-2 rounded border border-dashed border-gray-300 p-3 sm:grid-cols-[1fr,2fr,160px,160px,auto]"
+          className="grid grid-cols-1 gap-2 rounded border border-dashed border-line-strong p-3 sm:grid-cols-[1fr,2fr,160px,160px,auto]"
         >
           <select
             required
             value={userId}
             onChange={(e) => setUserId(e.target.value)}
-            className="rounded border border-gray-300 px-2 py-1.5 text-sm"
+            className="rounded border border-line-strong px-2 py-1.5 text-sm"
           >
             <option value="">— pick a member —</option>
             {users.map((u) => (
               <option key={u.id} value={u.id}>
-                {u.full_name || u.email}{u.role ? ` (${u.role})` : ''}{overworkSuffix(u)}
+                {u.full_name || u.email}{u.role ? ` (${roleLabel(u.role)})` : ''}{overworkSuffix(u)}
               </option>
             ))}
           </select>
@@ -320,7 +373,7 @@ export function AllocationsPanel({ projectId }: Props) {
             onChange={(e) => setRoleDescription(e.target.value)}
             placeholder="Role on project (e.g. Backend lead, QA reviewer)"
             maxLength={500}
-            className="rounded border border-gray-300 px-2 py-1.5 text-sm"
+            className="rounded border border-line-strong px-2 py-1.5 text-sm"
             aria-label="Role on project"
           />
           <input
@@ -328,14 +381,14 @@ export function AllocationsPanel({ projectId }: Props) {
             required
             value={startDate}
             onChange={(e) => setStartDate(e.target.value)}
-            className="rounded border border-gray-300 px-2 py-1.5 text-sm"
+            className="rounded border border-line-strong px-2 py-1.5 text-sm"
           />
           <input
             type="date"
             required
             value={endDate}
             onChange={(e) => setEndDate(e.target.value)}
-            className="rounded border border-gray-300 px-2 py-1.5 text-sm"
+            className="rounded border border-line-strong px-2 py-1.5 text-sm"
           />
           <button
             type="submit"
@@ -350,7 +403,7 @@ export function AllocationsPanel({ projectId }: Props) {
       {canSelfRequest && (
         <form
           onSubmit={(e) => void handleAssign(e)}
-          className="grid grid-cols-1 gap-2 rounded border border-dashed border-amber-300 bg-amber-50 p-3 sm:grid-cols-[2fr,160px,160px,auto]"
+          className="grid grid-cols-1 gap-2 rounded border border-dashed border-amber-100 bg-amber-50 p-3 sm:grid-cols-[2fr,160px,160px,auto]"
         >
           <input
             type="text"
@@ -358,7 +411,7 @@ export function AllocationsPanel({ projectId }: Props) {
             onChange={(e) => setRoleDescription(e.target.value)}
             placeholder="Role you'd play (e.g. Frontend contributor)"
             maxLength={500}
-            className="rounded border border-gray-300 px-2 py-1.5 text-sm"
+            className="rounded border border-line-strong px-2 py-1.5 text-sm"
             aria-label="Role on project"
           />
           <input
@@ -366,14 +419,14 @@ export function AllocationsPanel({ projectId }: Props) {
             required
             value={startDate}
             onChange={(e) => setStartDate(e.target.value)}
-            className="rounded border border-gray-300 px-2 py-1.5 text-sm"
+            className="rounded border border-line-strong px-2 py-1.5 text-sm"
           />
           <input
             type="date"
             required
             value={endDate}
             onChange={(e) => setEndDate(e.target.value)}
-            className="rounded border border-gray-300 px-2 py-1.5 text-sm"
+            className="rounded border border-line-strong px-2 py-1.5 text-sm"
           />
           <button
             type="submit"

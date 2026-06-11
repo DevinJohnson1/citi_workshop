@@ -88,7 +88,7 @@ _PROJECTION = (
 # (people page, allocation picker, deliverable-assignment picker, …) sees
 # the same threshold without having to recompute it on the client.
 _OVERWORK_PROJECT_THRESHOLD = 3
-_OVERWORK_DELIVERABLE_THRESHOLD = 10
+_OVERWORK_DELIVERABLE_THRESHOLD = 5
 
 # Workload counters joined onto every user row. Defined as a SQL fragment so
 # both the list and the single-row read share one source of truth.
@@ -96,9 +96,15 @@ _OVERWORK_DELIVERABLE_THRESHOLD = 10
 #   active_project_count     — distinct projects the user has at least one
 #                              APPROVED allocation on. Counted once per
 #                              project even if multiple allocation rows exist.
-#   active_deliverable_count — open assignments (completed_at IS NULL). One
-#                              user/deliverable pair is one count regardless
-#                              of role_on_assignment.
+#   active_deliverable_count — open assignments where the deliverable is
+#                              still in flight. "Open" = assignment has not
+#                              been completed (`completed_at IS NULL`) AND
+#                              the parent deliverable is not yet `done`
+#                              (a lead-marked Done deliverable should stop
+#                              counting against the assignee's workload even
+#                              if the per-assignment tick was never set).
+#                              `cancelled` deliverables are likewise excluded
+#                              because nobody is actually working on them.
 #   is_overworked            — derived boolean evaluated in SQL so it can't
 #                              drift between the API and the UI.
 _WORKLOAD_PROJECTION = f"""
@@ -110,7 +116,10 @@ _WORKLOAD_PROJECTION = f"""
     COALESCE((
         SELECT COUNT(*)
         FROM assignments asg
-        WHERE asg.user_id = u.id AND asg.completed_at IS NULL
+        JOIN deliverables d ON d.id = asg.deliverable_id
+        WHERE asg.user_id = u.id
+          AND asg.completed_at IS NULL
+          AND d.status NOT IN ('done','cancelled')
     ), 0) AS active_deliverable_count,
     (
         COALESCE((
@@ -120,7 +129,11 @@ _WORKLOAD_PROJECTION = f"""
         OR
         COALESCE((
             SELECT COUNT(*)
-            FROM assignments asg WHERE asg.user_id = u.id AND asg.completed_at IS NULL
+            FROM assignments asg
+            JOIN deliverables d ON d.id = asg.deliverable_id
+            WHERE asg.user_id = u.id
+              AND asg.completed_at IS NULL
+              AND d.status NOT IN ('done','cancelled')
         ), 0) > {_OVERWORK_DELIVERABLE_THRESHOLD}
     ) AS is_overworked
 """

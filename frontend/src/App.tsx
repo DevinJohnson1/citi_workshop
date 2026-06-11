@@ -11,6 +11,7 @@ import { ProjectDetailPage } from './pages/ProjectDetailPage';
 import { ResourcesPage } from './pages/ResourcesPage';
 import { ReportsPage } from './pages/ReportsPage';
 import { AdminPage } from './pages/AdminPage';
+import { ShowcasePage } from './pages/ShowcasePage';
 import { NotFoundPage } from './pages/NotFoundPage';
 
 /**
@@ -23,7 +24,7 @@ import { NotFoundPage } from './pages/NotFoundPage';
  *                  resources (full write), reports.
  *   - team_member: dashboard, projects (read), project detail, resources
  *                  (create with pending approval), reports.
- *   - viewer:      dashboard (read-only summary) and reports.
+ *   - viewer:      showcase (cinematic kiosk, default landing) and reports.
  */
 export function App() {
   return (
@@ -36,7 +37,7 @@ export function App() {
           <Route
             path="/dashboard"
             element={
-              <ProtectedRoute requireRole={['team_lead', 'team_member', 'viewer']}>
+              <ProtectedRoute requireRole={['team_lead', 'team_member']}>
                 <DashboardPage />
               </ProtectedRoute>
             }
@@ -84,6 +85,23 @@ export function App() {
           <Route
             path="/admin"
             element={<ProtectedRoute requireRole="admin"><AdminPage /></ProtectedRoute>}
+          />
+          {/* Showcase ("Big Picture") — kiosk mode, viewer-default home. */}
+          <Route
+            path="/showcase"
+            element={
+              <ProtectedRoute requireRole={['team_lead', 'team_member', 'viewer']}>
+                <ShowcasePage />
+              </ProtectedRoute>
+            }
+          />
+          <Route
+            path="/showcase/:projectId"
+            element={
+              <ProtectedRoute requireRole={['team_lead', 'team_member', 'viewer']}>
+                <ShowcasePage />
+              </ProtectedRoute>
+            }
           />
           <Route path="*" element={<NotFoundPage />} />
         </Routes>

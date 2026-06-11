@@ -11,46 +11,75 @@ it is the single source of truth for stack, schema, API, and deployment rules.
 | [`infra/`](./infra/README.md)                        | Terraform: S3, CloudFront, Lambda, RDS, Cognito| [`infra/README.md`](./infra/README.md)       |
 | [`bin/`](./bin/README.md)                            | Setup, deploy, dev, migrate scripts            | [`bin/README.md`](./bin/README.md)           |
 | [`docs/`](./docs)                                    | Workshop notes (evaluation, testing, …)        | n/a                                          |
-## Local setup (Postgres + LocalStack in Docker)
-Both Postgres and LocalStack run as containers defined in
-[`docker-compose.yml`](./docker-compose.yml), attached to a shared
-`coding-workshop` Docker network so Lambdas spawned by LocalStack reach
-Postgres at hostname `postgres:5432` — no host-gateway IP juggling, no
-`pg_hba.conf` edits, no native `postgresql` service to babysit.
+## Local setup (Aurora via LocalStack Pro)
+By default the entire stack runs inside a single `localstack/localstack-pro`
+container defined in [`docker-compose.yml`](./docker-compose.yml). Terraform
+provisions an Aurora-PostgreSQL 17 cluster **inside** LocalStack — there is no
+standalone Postgres container in the default path. A `postgres:17` fallback
+container is gated behind a Compose profile for users running LocalStack
+Community (no RDS support); pick the matching profile by setting
+`TF_VAR_aws_postgres_enabled=false` and `COMPOSE_PROFILES=postgres`.
 ```bash
 # 1. One-time host install (Docker, AWS CLI, Terraform — no host psql needed)
 ./bin/setup-environment.sh
-# 2. Bring up Postgres + LocalStack + backend + frontend (one command)
+# 2. Bring up LocalStack + provision Aurora + backend + frontend (one command)
 ./bin/start-dev.sh
 ```
 Or, if you want to run the pieces by hand:
 ```bash
-cp .env.example .env                       # workshop-safe defaults; edit to taste
-docker compose up -d postgres localstack   # start the containers
-./bin/migrate.sh local                     # apply SQL migrations (psql runs in-container)
-./bin/deploy-backend.sh local              # terraform apply against LocalStack
-./bin/generate-env.sh && cd frontend && npm run dev
+cp .env.example .env                       # set LOCALSTACK_AUTH_TOKEN for Pro
+docker compose up -d localstack            # starts LocalStack (Aurora hosted inside it)
+./bin/deploy-backend.sh local              # terraform apply (provisions Aurora + Lambdas)
+./bin/migrate.sh local                     # apply SQL migrations to the Aurora cluster
+./bin/seed-cognito.sh local                # plant the 4 personas + 40 ACME accounts
+./bin/generate-env.sh                      # writes frontend/.env.local (incl. VITE_SEED_LOGIN_ENABLED=true)
+cd frontend && npm run dev
 ```
-Ad-hoc SQL: `docker compose exec postgres psql -U postgres` — the host has no
-`psql` binary; everything runs inside the `postgres:17` container.
-Open <http://localhost:3000>. Auth is bypassed locally (`IS_LOCAL=true`); the
-backend treats every request as a fixed dev admin user. See `SYSTEM_DESIGN.md`
-§10 for why (LocalStack Cognito is a Pro feature).
+Ad-hoc SQL against the live Aurora cluster: use `./bin/migrate.sh local --shell`
+or read the Aurora endpoint from `terraform output rds_host_external` and dial
+it with a host `psql`. The legacy `docker compose exec postgres psql` works
+only on the Community fallback path.
+Open <http://localhost:3000>. Sign in with any of the four workshop personas
+using the quick-sign-in buttons on the login page (shared password
+`Workshop!2026`, seeded by `bin/seed-cognito.sh`). The buttons are gated by
+`VITE_SEED_LOGIN_ENABLED` — `true` on LocalStack, `false` on AWS.
 Stop the local stack:
 ```bash
 docker compose down            # keep volumes (data persists)
-docker compose down --volumes  # nuke Postgres + LocalStack state
+docker compose down --volumes  # nuke LocalStack state (Aurora data + Cognito pool)
 ```
 ## AWS deployment (workshop)
 ```bash
 ./bin/setup-participant.sh             # one-time per AWS account/role
 ./bin/deploy-backend.sh aws            # terraform apply (RDS, Cognito, S3, CF, Lambdas)
 ./bin/migrate.sh aws                   # psql against the new Aurora cluster
+./bin/seed-cognito.sh aws              # seeds the 40 @acme.org roster ONLY
+./bin/generate-env.sh                  # writes VITE_SEED_LOGIN_ENABLED=false
 ./bin/deploy-frontend.sh aws           # vite build → s3 sync → CloudFront invalidate
 ```
 `terraform output cloudfront_distribution_url` prints the live URL. Aurora's
 first request after idle takes 15–30 s (`min_capacity=0`) — the landing page
 shows a "warming up" indicator.
+### Login security on AWS
+`bin/seed-cognito.sh aws` deliberately **skips** the four shared
+`@workshop.local` test personas (they share `Workshop!2026` and exist only to
+back the dev-loop quick-sign-in buttons). The 40 `@acme.org` roster accounts
+each carry a unique 20-char alphanumeric password (~119 bits of entropy)
+printed at the end of the run — save them to your password manager.
+To force-seed the four shared personas on AWS (e.g. for a private demo pool)
+you must also override the shared password:
+```bash
+WORKSHOP_PASSWORD='<strong-passphrase>' \
+  SEED_INCLUDE_WORKSHOP=true \
+  ./bin/seed-cognito.sh aws
+```
+The script refuses to plant `Workshop!2026` into a real Cognito pool.
+On the frontend, `bin/generate-env.sh` writes `VITE_SEED_LOGIN_ENABLED=false`
+for the AWS target, which hides the persona buttons, the prefilled email/
+password fields, and the "default password" footer on `/login`. The
+SPA falls back to a plain email + password form that only accepts the
+roster accounts. To override per-deploy, export `VITE_SEED_LOGIN_ENABLED`
+before running `generate-env.sh`.
 ## Tear-down
 ```bash
 ./bin/cleanup-environment.sh           # terraform destroy + docker compose down --volumes
@@ -61,6 +90,39 @@ shows a "warming up" indicator.
 - **All AWS resources via Terraform.** No ClickOps, no `aws … create-*`, no SDK provisioning. Drift = bug.
 - **SQL is `psycopg` parameterized only.** No f-strings into SQL.
 - **JWT verified in-handler.** Function URLs are `authorization_type=NONE`; the in-handler check is the only guard.
+
+## Domain rules at a glance
+- **Project access is allocation-gated.** A non-owning `team_lead` or
+  `team_member` cannot add deliverables or resources to a project until they
+  hold an *approved* `allocation` on it. They may always self-request an
+  allocation (lands as `pending`); the owning lead approves it. Admins
+  bypass.
+- **Tangibles / intangibles can only be approved from within a project.**
+  Approval (`approval_status` flip) is restricted to the owning lead of the
+  item's `assigned_project_id`, or admin. The global resources page is
+  read + delete only — no rubber-stamping from outside the project.
+- **Deliverables form a per-project DAG.** The `depends_on` column is
+  validated server-side: same-project only, no cycles (see
+  `_validate_depends_on` in deliverables-service).
+- **Overwork threshold = >5 open deliverable assignments** per user, surfaced
+  on the People resources tab and the Reports overwork strip.
+- **Five-project seed.** Migration `003_seed_acme_projects.sql` plants a
+  realistic international-banking portfolio (3 large + 2 small projects,
+  79 deliverables with mixed statuses, 33 equipment items, 73 dependency
+  edges, 122 assignments, 32 allocations) so every report and chart
+  renders something meaningful out of the box.
+
+## UI conveniences
+- **Light / dark mode toggle** in the Topbar — persists per-browser via
+  `localStorage.telemetry.theme` and respects `prefers-color-scheme` on
+  first load. The Showcase ("Big Picture") kiosk is intentionally fixed to
+  its cinematic dark palette.
+- **Sortable tables everywhere.** Every data table (People, Deliverables,
+  Equipment, Allocations, Budget, Reports) ships with click-to-sort
+  headers via the shared `useSortableTable` hook + `<SortableHeader/>`
+  component. Null/empty values always sort last.
+- **Initial-bubble avatars** for every signed-in user, hue-mapped from the
+  email so the same person keeps the same colour everywhere.
 Workshop docs: [`docs/`](./docs).
 ## CI security checks
 Workflows under `.github/workflows/` run on every push and pull request:

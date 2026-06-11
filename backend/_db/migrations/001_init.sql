@@ -64,6 +64,23 @@ CREATE INDEX IF NOT EXISTS idx_projects_name_trgm  ON projects USING gin (LOWER(
 CREATE OR REPLACE TRIGGER set_projects_updated_at BEFORE UPDATE ON projects
   FOR EACH ROW EXECUTE FUNCTION trigger_set_updated_at();
 
+-- Co-leads. The singular `projects.owner_id` remains the canonical "primary"
+-- owner (the only one allowed to transfer ownership or delete the project),
+-- but any number of additional team_leads can be added as co-leads. A
+-- co-lead has the same write authority as the owner across every dependent
+-- service: assigning members, approving allocations, managing deliverables,
+-- editing budget, approving equipment, changing project status. The
+-- ``team_lead`` role is enforced application-side at write time so we don't
+-- have to repeat the user-row lookup in every CHECK constraint here.
+CREATE TABLE IF NOT EXISTS project_leads (
+  project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  user_id    UUID NOT NULL REFERENCES users(id)    ON DELETE CASCADE,
+  added_by   UUID REFERENCES users(id)             ON DELETE SET NULL,
+  added_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (project_id, user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_project_leads_user ON project_leads(user_id);
+
 CREATE TABLE IF NOT EXISTS deliverables (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,

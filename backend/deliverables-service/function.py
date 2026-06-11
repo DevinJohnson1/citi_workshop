@@ -14,6 +14,7 @@ from pydantic import Field, ValidationError
 
 from _lib import db, http
 from _lib.auth import AuthError, current_user, handle_auth_errors, verify_token
+from _lib.projects import is_project_lead
 from _lib.validation import DeliverableStatus, StrictModel, first_error
 
 _LOG = logging.getLogger()
@@ -143,19 +144,76 @@ def _project_owner(conn, project_id: str) -> str | None:
     return row["owner_id"] if row else None
 
 
-def _user_allocated_to_project(conn, user_id: str, project_id: str) -> bool:
-    """True if the user has any allocation row on the project (any date window).
+def _user_approved_on_project(conn, user_id: str, project_id: str) -> bool:
+    """True if the user holds an *approved* allocation on the project.
 
-    Team members may propose deliverables on projects they're allocated to; the
-    UI marks them as ``status='todo'`` ("awaiting team-lead approval") and the
-    team lead then PATCHes the status to ``in_progress`` or ``cancelled``.
+    Tightened from the previous "any allocation row" check so that a pending
+    or rejected self-request does not silently grant write access. Mirrors
+    the same gate used by assignments-service and equipment-service: nobody
+    contributes to a project until a lead has accepted them onto it.
     """
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT 1 FROM allocations WHERE user_id = %s AND project_id = %s LIMIT 1",
+            "SELECT 1 FROM allocations "
+            " WHERE user_id = %s AND project_id = %s "
+            "   AND approval_status = 'approved' LIMIT 1",
             (user_id, project_id),
         )
         return cur.fetchone() is not None
+
+
+def _validate_depends_on(
+    conn,
+    project_id: str,
+    deliverable_id: str | None,
+    parent_id: str | None,
+) -> None:
+    """Validate a candidate ``depends_on`` value before persisting it.
+
+    Raises ``ValueError`` (→ HTTP 400) if the choice is invalid. The rules:
+
+      * ``None`` is always allowed (clears the dependency).
+      * A deliverable cannot depend on itself.
+      * The referenced parent must exist and belong to the *same* project
+        — dependency chains never cross project boundaries (the report's
+        recursive CTE is scoped per project).
+      * Setting ``D.depends_on = P`` must not create a cycle. Walking from
+        ``P`` upward via ``depends_on`` may never reach ``D``; if it does,
+        ``P`` is already a (transitive) descendant of ``D`` and the new
+        edge would close a loop. Only meaningful when editing an
+        existing row (``deliverable_id`` not ``None``).
+    """
+    if parent_id is None:
+        return
+    if deliverable_id is not None and parent_id == deliverable_id:
+        raise ValueError("depends_on: a deliverable cannot depend on itself")
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT project_id FROM deliverables WHERE id = %s", (parent_id,),
+        )
+        row = cur.fetchone()
+    if not row:
+        raise ValueError("depends_on: referenced deliverable does not exist")
+    if row["project_id"] != project_id:
+        raise ValueError(
+            "depends_on: must reference a deliverable on the same project"
+        )
+    if deliverable_id is None:
+        return
+    seen: set[str] = set()
+    node: str | None = parent_id
+    while node is not None and node not in seen:
+        if node == deliverable_id:
+            raise ValueError("depends_on: would create a dependency cycle")
+        seen.add(node)
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT depends_on FROM deliverables WHERE id = %s", (node,),
+            )
+            r = cur.fetchone()
+        if not r:
+            return
+        node = r["depends_on"]
 
 
 def _create(event: Mapping[str, Any]) -> dict[str, Any]:
@@ -166,17 +224,31 @@ def _create(event: Mapping[str, Any]) -> dict[str, Any]:
     if owner is None:
         return http.not_found("Project not found", event)
     is_admin = user["role"] == "admin"
-    is_owning_lead = user["role"] == "team_lead" and owner == user["id"]
-    # team_members may propose deliverables on projects they're allocated to.
-    # Force status=todo so the owning lead must approve before work starts.
-    is_allocated_member = (
-        user["role"] == "team_member"
-        and _user_allocated_to_project(conn, user["id"], body.project_id)
+    # Owning lead OR any co-lead — see _lib/projects.is_project_lead.
+    is_owning_lead = (
+        user["role"] == "team_lead"
+        and is_project_lead(conn, body.project_id, user["id"])
     )
-    if not (is_admin or is_owning_lead or is_allocated_member):
+    # Non-owners (team_lead or team_member) may propose deliverables on
+    # projects they hold an *approved* allocation on. Their submissions are
+    # forced to status='todo' so the owning lead must approve before any
+    # work starts. An approved allocation is the single gate that opens
+    # project-side write access — see also assignments-service and
+    # equipment-service for the matching rule.
+    is_allocated_contributor = (
+        user["role"] in ("team_lead", "team_member")
+        and not is_owning_lead
+        and _user_approved_on_project(conn, user["id"], body.project_id)
+    )
+    if not (is_admin or is_owning_lead or is_allocated_contributor):
         raise AuthError(403, "Insufficient role")
-    if is_allocated_member:
+    if is_allocated_contributor:
         body = body.model_copy(update={"status": "todo"})
+
+    # Validate depends_on against the same-project / existence rules.
+    # Cycle check is unnecessary on insert (the row doesn't exist yet, so
+    # nothing can already point at it).
+    _validate_depends_on(conn, body.project_id, None, body.depends_on)
 
     with db.transaction() as conn, conn.cursor() as cur:
         cur.execute(
@@ -200,11 +272,11 @@ def _create(event: Mapping[str, Any]) -> dict[str, Any]:
     return http.created(row, event)
 
 
-def _can_patch(user: dict, owner_id: str | None, deliverable_id: str, body: "DeliverablePatch") -> bool:
+def _can_patch(user: dict, project_id: str, deliverable_id: str, body: "DeliverablePatch") -> bool:
     """Status-only updates are allowed for any user with an open assignment."""
     if user["role"] == "admin":
         return True
-    if user["role"] == "team_lead" and owner_id == user["id"]:
+    if user["role"] == "team_lead" and is_project_lead(db.get_conn(), project_id, user["id"]):
         return True
     set_fields = body.model_dump(exclude_unset=True)
     if set(set_fields.keys()) == {"status"}:
@@ -229,15 +301,22 @@ def _patch(event: Mapping[str, Any], deliverable_id: str) -> dict[str, Any]:
     conn = db.get_conn()
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT d.id, p.owner_id FROM deliverables d "
+            "SELECT d.id, d.project_id, p.owner_id FROM deliverables d "
             "JOIN projects p ON p.id = d.project_id WHERE d.id = %s",
             (deliverable_id,),
         )
         existing = cur.fetchone()
     if not existing:
         return http.not_found(event=event)
-    if not _can_patch(user, existing["owner_id"], deliverable_id, body):
+    if not _can_patch(user, existing["project_id"], deliverable_id, body):
         raise AuthError(403, "Insufficient role")
+
+    # If depends_on is being (re)set, enforce same-project + no-cycle rules.
+    # `depends_on=None` is permitted (it clears the dependency).
+    if "depends_on" in fields:
+        _validate_depends_on(
+            conn, existing["project_id"], deliverable_id, fields["depends_on"],
+        )
 
     set_sql = ", ".join(f"{k} = %s" for k in fields)
     with db.transaction() as conn, conn.cursor() as cur:
@@ -264,14 +343,17 @@ def _delete(event: Mapping[str, Any], deliverable_id: str) -> dict[str, Any]:
     conn = db.get_conn()
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT p.owner_id FROM deliverables d JOIN projects p ON p.id = d.project_id "
+            "SELECT d.project_id, p.owner_id FROM deliverables d JOIN projects p ON p.id = d.project_id "
             "WHERE d.id = %s",
             (deliverable_id,),
         )
         existing = cur.fetchone()
     if not existing:
         return http.not_found(event=event)
-    if user["role"] != "admin" and not (user["role"] == "team_lead" and existing["owner_id"] == user["id"]):
+    if user["role"] != "admin" and not (
+        user["role"] == "team_lead"
+        and is_project_lead(conn, existing["project_id"], user["id"])
+    ):
         raise AuthError(403, "Insufficient role")
     with db.transaction() as conn, conn.cursor() as cur:
         cur.execute("DELETE FROM deliverables WHERE id = %s", (deliverable_id,))
