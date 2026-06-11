@@ -16,9 +16,10 @@ locals {
   ])))
   private_subnet_ids = sort(tolist(setsubtract(data.aws_subnets.this.ids, local.public_subnet_ids)))
 
-  # True when Cognito resources should exist: any real AWS account, OR when
-  # the operator explicitly opted in (LocalStack Pro). See var.enable_cognito.
-  cognito_enabled = data.aws_caller_identity.this.id != "000000000000" || var.enable_cognito
+  # True when Cognito resources should be provisioned. var.enable_cognito is
+  # authoritative on both real AWS and LocalStack so participants can disable
+  # Cognito when their assumed role lacks cognito-idp:CreateUserPool perms.
+  cognito_enabled = var.enable_cognito
 
   # Auto-discover Python Lambda services (SYSTEM_DESIGN §0). One level deep;
   # underscore-prefixed dirs (_lib, _db, _examples) are excluded. Java and

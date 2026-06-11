@@ -102,6 +102,11 @@
     },
     {
       "Effect": "Allow",
+      "Action": ["cognito-idp:*", "cognito-identity:*"],
+      "Resource": "*"
+    },
+    {
+      "Effect": "Allow",
       "Action": "iam:CreateServiceLinkedRole",
       "Resource": "arn:aws:iam::*:role/aws-service-role/rds.amazonaws.com/AWSServiceRoleForRDS",
       "Condition": {
