@@ -65,6 +65,17 @@ output "cognito_domain" {
   value       = try(element(aws_cognito_user_pool_domain.this.*.domain, 0), "")
 }
 
+output "dev_auth_bypass_enabled" {
+  description = "Whether the dev-auth bypass is on for this deployment. Consumed by bin/generate-env.sh to emit VITE_DEV_AUTH_BYPASS so the SPA short-circuits sign-in for the four legacy seed personas. Mirrors the Lambda env var AUTH_DEV_BYPASS."
+  value       = var.enable_dev_auth_bypass ? "true" : "false"
+}
+
+output "workshop_password" {
+  description = "Shared plaintext password for the @workshop.local personas. Only meaningful when var.enable_dev_auth_bypass=true. Consumed by bin/generate-env.sh to prefill the persona buttons. Sensitive only in the terraform state — the SPA bundle ships it in cleartext."
+  value       = var.workshop_password
+  sensitive   = true
+}
+
 # --- RDS outputs (consumed by bin/migrate.sh) ---
 output "rds_endpoint" {
   description = "Aurora cluster writer endpoint (empty when aws_postgres_enabled=false). On LocalStack this is the cluster DNS; for Lambda containers use rds_host_lambda instead."

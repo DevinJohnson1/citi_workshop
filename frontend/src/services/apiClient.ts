@@ -92,48 +92,13 @@ export function useApi(): ApiClient {
       return h;
     };
 
-    /**
-     * Parse the response body, throwing `ApiError` on non-2xx.
-     *
-     * Defensive against three real-world AWS failure modes that otherwise
-     * surface in the browser as the unhelpful
-     * `SyntaxError: JSON.parse: unexpected character at line 1 column 1
-     * of the JSON data`:
-     *   1. Lambda returns 200 with `Content-Type: application/json` but an
-     *      empty body (cold-start race, mis-handled error path).
-     *   2. CloudFront falls back to the SPA `index.html` (HTML, not JSON)
-     *      when an `/api/*` path doesn't match any `ordered_cache_behavior`.
-     *   3. API Gateway / Function URL returns a 5xx HTML error page even
-     *      though the request advertised JSON.
-     * We read the raw text first and only call `JSON.parse` when there's
-     * actually something to parse; otherwise we attach the raw body to the
-     * thrown `ApiError` so the caller can show something diagnostic.
-     */
+    /** Parse the response body, throwing `ApiError` on non-2xx. */
     const handle = async <T,>(res: Response): Promise<T> => {
       if (res.status === 204) return undefined as T;
-      const contentType = res.headers.get('content-type') ?? '';
-      const isJson = contentType.includes('json');
-      const rawText = await res.text();
-      let body: unknown = null;
-      if (rawText.length > 0) {
-        if (isJson) {
-          try {
-            body = JSON.parse(rawText);
-          } catch {
-            // Server lied about content-type. Fall through with body=null
-            // and let the !res.ok branch (or the snippet below) report it.
-            body = null;
-          }
-        }
-      }
+      const isJson = (res.headers.get('content-type') ?? '').includes('json');
+      const body = isJson ? await res.json() : null;
       if (!res.ok) {
-        throw new ApiError(res.status, isJson && body ? (body as ApiErrorBody) : {
-          error: `HTTP_${res.status}`,
-          message: rawText.length === 0
-            ? `Empty response from ${res.url} (status ${res.status})`
-            : `Non-JSON response from ${res.url} (status ${res.status}): ${rawText.slice(0, 200)}`,
-          timestamp: new Date().toISOString(),
-        });
+        throw new ApiError(res.status, isJson ? (body as ApiErrorBody) : null);
       }
       return body as T;
     };

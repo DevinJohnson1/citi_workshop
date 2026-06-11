@@ -4,6 +4,7 @@ via cached JWKS) on every invocation. Cognito must be deployed in the target
 environment (real AWS or LocalStack Pro with ``var.enable_cognito=true``).
 """
 from __future__ import annotations
+import base64
 import functools
 import os
 import time
@@ -17,6 +18,25 @@ _CLIENT_ID = os.getenv("COGNITO_CLIENT_ID", "")
 # `iss` claim points at `localhost.localstack.cloud` (reachable from the
 # browser) while the Lambda container has to dial `workshop-localstack`.
 _JWKS_URL = os.getenv("COGNITO_JWKS_URL", "")
+# DEV-ONLY ESCAPE HATCH. When AUTH_DEV_BYPASS=true the backend accepts
+# bearer tokens of the form ``dev-bypass.<email>.<nonce>`` for the legacy
+# seed personas (admin/lead/member/viewer @workshop.local) without any
+# cryptographic verification. Anyone who can reach a Lambda URL can mint
+# such a token and sign in as admin — only enable in workshop deployments
+# where the four seed accounts already share a single shared password.
+# Toggle via Terraform var ``enable_dev_auth_bypass`` → Lambda env var.
+_DEV_BYPASS = os.getenv("AUTH_DEV_BYPASS", "").strip().lower() == "true"
+_DEV_BYPASS_PREFIX = "dev-bypass."
+_DEV_BYPASS_EMAILS: frozenset[str] = frozenset({
+    "admin@workshop.local",
+    "lead@workshop.local",
+    "member@workshop.local",
+    "viewer@workshop.local",
+})
+# Shared plaintext password the SPA must embed in every bypass token. Wired
+# from Terraform var.workshop_password → Lambda env. Compared verbatim, no
+# hashing — see SECURITY note on _verify_dev_bypass below.
+_WORKSHOP_PASSWORD = os.getenv("WORKSHOP_PASSWORD", "")
 # Workshop seed accounts (see bin/seed-cognito.sh). On first login we stamp
 # the matching role on the DB row; real users default to "viewer".
 _SEED_ROLES: dict[str, str] = {
@@ -94,13 +114,52 @@ def _extract_bearer(event: Mapping[str, Any]) -> str:
     if not auth.lower().startswith("bearer "):
         raise AuthError(401, "Authentication required")
     return auth.split(" ", 1)[1].strip()
+def _verify_dev_bypass(token: str) -> dict[str, Any]:
+    """Synthesize claims for a ``dev-bypass.<email>.<b64-password>.<nonce>`` token.
+
+    SECURITY: the password is compared as plaintext against
+    ``WORKSHOP_PASSWORD`` (no hashing). Any sniffer or anyone with access to
+    the deployed JS bundle can extract this value — treat it as friction, not
+    as security. Logs to CloudWatch on every use so misuse in prod is visible.
+    Rejects anything outside the four hard-coded legacy seed emails.
+    """
+    parts = token.split(".", 3)
+    if len(parts) < 4:
+        raise AuthError(401, "Authentication required")
+    email = parts[1].strip().lower()
+    if email not in _DEV_BYPASS_EMAILS:
+        raise AuthError(401, "Authentication required")
+    try:
+        provided_password = base64.urlsafe_b64decode(parts[2] + "===").decode("utf-8")
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise AuthError(401, "Authentication required") from exc
+    expected = _WORKSHOP_PASSWORD
+    if not expected or provided_password != expected:
+        print(f"[auth] AUTH_DEV_BYPASS password mismatch for {email!r}")
+        raise AuthError(401, "Invalid credentials")
+    print(f"[auth] AUTH_DEV_BYPASS in use for {email!r} — NOT FOR PRODUCTION")
+    return {
+        "sub": f"dev-bypass:{email}",
+        "email": email,
+        "token_use": "id",
+        "iss": _ISSUER or "dev-bypass",
+        "aud": _CLIENT_ID or "dev-bypass",
+        "exp": int(time.time()) + 3600,
+    }
 def verify_token(event: Mapping[str, Any]) -> dict[str, Any]:
     """Verify a Cognito JWT (ID **or** access token) and return its claims.
     ID tokens bind via ``aud``; access tokens via ``client_id``. PyJWT's
     ``verify_aud`` is disabled so we can branch on ``token_use`` without it
     raising on access tokens that legitimately lack ``aud``.
+
+    When ``AUTH_DEV_BYPASS=true`` is set in the Lambda env, tokens of the
+    form ``dev-bypass.<email>.<nonce>`` are accepted for the four legacy
+    seed personas WITHOUT any cryptographic verification. See module
+    docstring on ``_DEV_BYPASS``.
     """
     token = _extract_bearer(event)
+    if _DEV_BYPASS and token.startswith(_DEV_BYPASS_PREFIX):
+        return _verify_dev_bypass(token)
     try:
         signing_key = _jwks_client().get_signing_key_from_jwt(token).key
         claims = jwt.decode(

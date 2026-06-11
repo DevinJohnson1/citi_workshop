@@ -46,3 +46,15 @@ variable "enable_cognito" {
   default     = false
 }
 
+variable "enable_dev_auth_bypass" {
+  description = "DEV-ONLY ESCAPE HATCH. When true, the SPA short-circuits sign-in for the four legacy seed personas (admin/lead/member/viewer @workshop.local) and the Lambdas accept the resulting `dev-bypass.<email>.<b64-password>.<nonce>` bearer tokens without any cryptographic verification — only a plaintext compare against `workshop_password`. Defaults to TRUE because the workshop template ships shared seed accounts and a public SPA; the bypass keeps the dev loop unblocked when Cognito provisioning is flaky. Set to false (e.g. `-var enable_dev_auth_bypass=false`) for any deployment that holds non-disposable data."
+  type        = bool
+  default     = true
+}
+
+variable "workshop_password" {
+  description = "Shared plaintext password the four @workshop.local seed personas must present when the dev-auth bypass is enabled. Compared verbatim inside the Lambda (no hashing) against the password embedded in the bearer token. Wire from the host shell with `export TF_VAR_workshop_password=$WORKSHOP_PASSWORD` (deploy-backend.sh does this automatically if `.env` exists in the project root). Anyone with the SPA bundle can read this value — treat it as friction, not as security."
+  type        = string
+  default     = "Workshop!2026"
+  sensitive   = true
+}

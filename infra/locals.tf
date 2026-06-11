@@ -134,6 +134,13 @@ locals {
       : try(format("https://cognito-idp.%s.amazonaws.com/%s/.well-known/jwks.json", data.aws_region.this.region, element(aws_cognito_user_pool.this.*.id, 0)), "")
     ) : ""
     CORS_ALLOWED_ORIGINS = local.cors_allowed_origins
+    # DEV-ONLY auth bypass — see variable.tf:enable_dev_auth_bypass. Passed as
+    # "true"/"" rather than bool so the Lambda env preserves the off-state as
+    # an unset-looking empty string.
+    AUTH_DEV_BYPASS = var.enable_dev_auth_bypass ? "true" : ""
+    # Shared plaintext password the dev-auth bypass compares against. See
+    # variable.tf:workshop_password — leak this and admin access leaks with it.
+    WORKSHOP_PASSWORD = var.workshop_password
   }
   iam_arns = [
     format("arn:%s:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole", data.aws_partition.this.partition),

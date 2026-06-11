@@ -120,6 +120,17 @@ if [ "$ENVIRONMENT" = "local" ]; then
     exit 0
 fi
 
+# Regenerate frontend/.env.local from the CURRENT terraform outputs before
+# building. Without this step, `npm run build` inlines whatever
+# VITE_COGNITO_CLIENT_ID / authority / endpoint happens to be on disk — which
+# is stale whenever the Cognito user pool client was re-created by a recent
+# `terraform apply`. Symptom in prod: cognito-idp returns
+#   "Unable to find user pool client with ID <old-id>"
+# even though the live pool has a different id. Regenerating here makes the
+# build deterministic w.r.t. the deployed infra.
+echo "INFO: Refreshing frontend/.env.local from terraform outputs..."
+"$SCRIPT_DIR/generate-env.sh"
+
 # Build React frontend for production
 cd "$FRONTEND_DIR"
 echo "INFO: Building frontend..."
@@ -160,12 +171,11 @@ else
 fi
 echo "INFO: Build directory - $BUILD_DIR"
 
-# Remove sample environment file
-rm -f $BUILD_DIR/.env.sample
-
-if [ ! -f .env ] && [ -f $BUILD_DIR/.env.local ]; then
-    mv -f $BUILD_DIR/.env.local $BUILD_DIR/.env
-fi
+# Strip env files from the build output. Vite already inlined every VITE_*
+# value into the JS bundle at build time, so these files have zero runtime
+# effect — uploading them to the public S3 bucket would only leak config
+# (authority URL, client id, endpoint hostnames) to anyone who guesses /.env.
+rm -f "$BUILD_DIR/.env" "$BUILD_DIR/.env.local" "$BUILD_DIR/.env.sample"
 
 # Upload built frontend to S3 (with deletion of old files)
 aws s3 sync $BUILD_DIR/ s3://$BUCKET_NAME/ --delete $AWS_ENDPOINT

@@ -108,6 +108,8 @@ LAMBDA_URLS=$(terraform output -json lambda_urls 2>/dev/null || echo "{}")
 COGNITO_CLIENT_ID=$(terraform output -raw cognito_client_id 2>/dev/null || echo "")
 COGNITO_ISSUER_URL=$(terraform output -raw cognito_issuer_url 2>/dev/null || echo "")
 COGNITO_DOMAIN=$(terraform output -raw cognito_domain 2>/dev/null || echo "")
+DEV_AUTH_BYPASS=$(terraform output -raw dev_auth_bypass_enabled 2>/dev/null || echo "false")
+WORKSHOP_PASSWORD_TF=$(terraform output -raw workshop_password 2>/dev/null || echo "")
 
 if [ "$ENVIRONMENT" = "aws" ]; then
     VITE_COGNITO_ENDPOINT="https://cognito-idp.${AWS_REGION:-us-east-1}.amazonaws.com"
@@ -156,6 +158,8 @@ VITE_COGNITO_REDIRECT_URI=$VITE_REDIRECT_URI
 VITE_COGNITO_ENDPOINT=$VITE_COGNITO_ENDPOINT
 VITE_COGNITO_REGION=$VITE_COGNITO_REGION
 VITE_SEED_LOGIN_ENABLED=$SEED_LOGIN_ENABLED
+VITE_DEV_AUTH_BYPASS=$DEV_AUTH_BYPASS
+VITE_WORKSHOP_PASSWORD=$WORKSHOP_PASSWORD_TF
 EOF
 
 echo ""

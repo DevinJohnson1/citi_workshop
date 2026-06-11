@@ -25,7 +25,9 @@ const SEED_USERS: SeedPersona[] = [
   { email: 'viewer@workshop.local', role: 'viewer', label: 'Viewer' },
 ];
 
-const SEED_PASSWORD = 'Workshop!2026';
+const SEED_PASSWORD = String(
+  import.meta.env.VITE_WORKSHOP_PASSWORD ?? 'Workshop!2026',
+);
 
 /**
  * Whether to surface the quick-sign-in shortcut UI (persona buttons,
