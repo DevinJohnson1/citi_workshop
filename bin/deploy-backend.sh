@@ -108,16 +108,10 @@ else
 fi
 
 # Source root .env in BOTH branches (the LocalStack arm above also sources it
-# for LOCALSTACK_*; doing it here makes WORKSHOP_PASSWORD visible on AWS too).
-# Forward to terraform as TF_VAR_workshop_password so the Lambdas get the value
-# the participant set in .env — required for the dev-auth bypass plaintext
-# password check. Falls back to the variable's default if .env doesn't set it.
+# for LOCALSTACK_*; doing it here makes shared vars visible on AWS too).
 if [ -f "$PROJECT_ROOT/.env" ]; then
     # shellcheck disable=SC1090
     set -a; . "$PROJECT_ROOT/.env"; set +a
-fi
-if [ -n "${WORKSHOP_PASSWORD:-}" ]; then
-    export TF_VAR_workshop_password="$WORKSHOP_PASSWORD"
 fi
 
 # Initialize Terraform with backend configuration

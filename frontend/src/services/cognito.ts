@@ -6,28 +6,6 @@
 
 import { setSession, roleForEmail } from '../auth/session';
 
-/**
- * Hard-coded list of the four legacy seed personas that the dev-auth bypass
- * applies to. Kept in lockstep with backend `_lib/auth.py:_DEV_BYPASS_EMAILS`.
- * The ACME roster is intentionally NOT bypassable — only the workshop accounts
- * that already share `WORKSHOP_PASSWORD` are eligible.
- */
-const DEV_BYPASS_EMAILS: ReadonlySet<string> = new Set([
-  'admin@workshop.local',
-  'lead@workshop.local',
-  'member@workshop.local',
-  'viewer@workshop.local',
-]);
-
-/** True when the build was produced with VITE_DEV_AUTH_BYPASS=true. */
-const DEV_BYPASS_ENABLED =
-  String(import.meta.env.VITE_DEV_AUTH_BYPASS).toLowerCase() === 'true';
-
-/** Shared workshop password the bypass requires. Baked into the JS bundle —
- * anyone who reads the bundle learns it. The backend independently verifies
- * the password against its own WORKSHOP_PASSWORD env var on every request,
- * so falsifying this constant in the bundle still won't get you in. */
-const DEV_BYPASS_PASSWORD = String(import.meta.env.VITE_WORKSHOP_PASSWORD ?? '');
 
 interface AuthenticationResult {
   AccessToken: string;
@@ -87,47 +65,6 @@ function decodeEmail(idToken: string): string {
  * @throws {CognitoError} when Cognito rejects the credentials or is unreachable.
  */
 export async function signIn(email: string, password: string): Promise<void> {
-  const normalized = email.trim().toLowerCase();
-
-  // Dev-auth bypass: skip cognito-idp entirely for the four legacy seed
-  // personas when the build was produced with VITE_DEV_AUTH_BYPASS=true and
-  // the backend Lambdas were deployed with AUTH_DEV_BYPASS=true. The bearer
-  // token shape ("dev-bypass.<email>.<b64(password)>.<nonce>") is recognised
-  // by `backend/_lib/auth.py:_verify_dev_bypass`, which compares the password
-  // verbatim against its WORKSHOP_PASSWORD env var. The password is embedded
-  // in plaintext (base64-encoded only to survive the dot separator) — anyone
-  // who reads the bundle learns it. Treat as friction, not as security. See
-  // SECURITY.md.
-  if (DEV_BYPASS_ENABLED && DEV_BYPASS_EMAILS.has(normalized)) {
-    // Client-side check for instant UX feedback. The backend re-checks the
-    // same password against its WORKSHOP_PASSWORD env var on every request,
-    // so this is the friendly-error path, not the security boundary.
-    if (!DEV_BYPASS_PASSWORD || password !== DEV_BYPASS_PASSWORD) {
-      throw new CognitoError('NotAuthorizedException', 'Incorrect email or password.');
-    }
-    const nonce =
-      typeof crypto !== 'undefined' && 'randomUUID' in crypto
-        ? crypto.randomUUID()
-        : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
-    // url-safe base64 of utf-8 password — matches Python's
-    // base64.urlsafe_b64decode on the backend.
-    const passwordB64 = btoa(
-      Array.from(new TextEncoder().encode(password))
-        .map((b) => String.fromCharCode(b))
-        .join(''),
-    )
-      .replace(/\+/g, '-')
-      .replace(/\//g, '_');
-    const token = `dev-bypass.${normalized}.${passwordB64}.${nonce}`;
-    setSession({
-      accessToken: token,
-      idToken: token,
-      expiresAt: Math.floor(Date.now() / 1000) + 3600,
-      email: normalized,
-      role: roleForEmail(normalized),
-    });
-    return;
-  }
 
   const endpoint = import.meta.env.VITE_COGNITO_ENDPOINT as string | undefined;
   const clientId = import.meta.env.VITE_COGNITO_CLIENT_ID as string | undefined;

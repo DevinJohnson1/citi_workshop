@@ -128,8 +128,16 @@ fi
 #   "Unable to find user pool client with ID <old-id>"
 # even though the live pool has a different id. Regenerating here makes the
 # build deterministic w.r.t. the deployed infra.
-echo "INFO: Refreshing frontend/.env.local from terraform outputs..."
-"$SCRIPT_DIR/generate-env.sh"
+# If the participant has hand-edited frontend/.env.local we leave it alone —
+# blowing away their overrides on every deploy is hostile. Only regenerate when
+# the file is missing, or when REGENERATE_ENV=1 is set explicitly.
+FRONTEND_ENV_LOCAL="$FRONTEND_DIR/.env.local"
+if [ "${REGENERATE_ENV:-0}" = "1" ] || [ ! -f "$FRONTEND_ENV_LOCAL" ]; then
+    echo "INFO: Refreshing frontend/.env.local from terraform outputs..."
+    "$SCRIPT_DIR/generate-env.sh"
+else
+    echo "INFO: Preserving existing frontend/.env.local (set REGENERATE_ENV=1 to overwrite)"
+fi
 
 # Build React frontend for production
 cd "$FRONTEND_DIR"
