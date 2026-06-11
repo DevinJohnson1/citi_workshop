@@ -55,6 +55,11 @@ ENVIRONMENT=${1:-"aws"}
 export PATH="$HOME/.local/bin:$PATH"
 export AWS_REGION=${AWS_REGION:-us-east-1}
 
+# Disable AWS CLI v2 output pager. Without this, commands that emit JSON
+# (e.g. `aws cloudfront create-invalidation`) pipe into `less` and appear to
+# hang the deploy until the user presses `q`.
+export AWS_PAGER=""
+
 echo "INFO: Deploying frontend..."
 echo "INFO: Environment - $ENVIRONMENT"
 
@@ -118,6 +123,19 @@ fi
 # Build React frontend for production
 cd "$FRONTEND_DIR"
 echo "INFO: Building frontend..."
+
+# Install dependencies on first run (or when package-lock.json is newer than
+# node_modules). Without this, fresh machines fail with TS2307/TS2688 errors
+# because vite, @vitejs/plugin-react, @tailwindcss/vite, and the vite/client
+# type definitions have not been installed yet.
+if [ ! -d "node_modules" ] || [ package-lock.json -nt node_modules ]; then
+    echo "INFO: Installing frontend dependencies..."
+    if [ -f package-lock.json ]; then
+        npm ci
+    else
+        npm install
+    fi
+fi
 
 # Set API environment variables for build (REACT_APP_* for CRA, VITE_* for Vite)
 export REACT_APP_API_URL="$API_BASE_URL"

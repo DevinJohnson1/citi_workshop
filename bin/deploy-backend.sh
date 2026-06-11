@@ -130,11 +130,35 @@ if [ -d "$LIB_SRC" ]; then
     done
 fi
 
+# migrate-service additionally ships every SQL file in backend/_db/migrations
+# inside its deployment package, under _migrations/. The Lambda reads them
+# from there at runtime — see backend/migrate-service/function.py for the
+# matching loader. This is the only service that needs the migrations
+# bundled, so we special-case it instead of copying into every service dir.
+MIGRATE_SVC="$PROJECT_ROOT/backend/migrate-service"
+MIGRATIONS_SRC="$PROJECT_ROOT/backend/_db/migrations"
+if [ -d "$MIGRATE_SVC" ] && [ -d "$MIGRATIONS_SRC" ]; then
+    rsync -a --delete "$MIGRATIONS_SRC/" "$MIGRATE_SVC/_migrations/"
+fi
+
 terraform apply -auto-approve
 echo "INFO: Infrastructure deployment complete!"
 
-# Post-deployment steps for local environments only.
-# These are safe to call after every apply; both scripts are idempotent.
+# Post-deployment: apply SQL migrations against the freshly-deployed DB by
+# invoking the migrate-service Lambda. Same script, same Lambda, same SQL
+# for both targets — only the AWS endpoint differs (LocalStack vs real AWS).
+# Idempotent, so re-running deploy-backend.sh is safe.
+echo ""
+echo "INFO: Applying database migrations..."
+"$SCRIPT_DIR/migrate.sh" "$ENVIRONMENT" || {
+    echo "WARNING: Migration run failed — see output above."
+    echo "         Re-run manually with: ./bin/migrate.sh $ENVIRONMENT"
+}
+
+# Local-only post-deploy: seed Cognito personas and regenerate the
+# frontend .env.local. On AWS these are explicit one-time steps the
+# participant runs themselves (seed-cognito.sh has stricter password
+# rules, generate-env.sh is called by deploy-frontend.sh).
 if [ "$ENVIRONMENT" != "aws" ]; then
     echo ""
     echo "INFO: Seeding Cognito users..."

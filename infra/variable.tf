@@ -41,8 +41,8 @@ variable "cloudfront_domain" {
 }
 
 variable "enable_cognito" {
-  description = "Force-enable Cognito resources even on LocalStack (account id 000000000000). Default true — assumes LocalStack Pro locally. Set false only when running LocalStack Community, in which case Cognito resources are skipped and Lambdas will reject every request (no dev-user fallback)."
+  description = "Provision the Cognito user pool, app client, and hosted UI domain. Default false because the workshop participant IAM role typically lacks cognito-idp:CreateUserPool. Override with `TF_VAR_enable_cognito=true` (or `-var enable_cognito=true`) when running against LocalStack Pro or an AWS account whose role does grant cognito-idp:*. When false the Lambdas will reject authenticated requests because no user pool exists."
   type        = bool
-  default     = true
+  default     = false
 }
 

@@ -29,16 +29,17 @@ Or, if you want to run the pieces by hand:
 ```bash
 cp .env.example .env                       # set LOCALSTACK_AUTH_TOKEN for Pro
 docker compose up -d localstack            # starts LocalStack (Aurora hosted inside it)
-./bin/deploy-backend.sh local              # terraform apply (provisions Aurora + Lambdas)
-./bin/migrate.sh local                     # apply SQL migrations to the Aurora cluster
+./bin/deploy-backend.sh local              # terraform apply + auto-runs migrate.sh local
 ./bin/seed-cognito.sh local                # plant the 4 personas + 40 ACME accounts
 ./bin/generate-env.sh                      # writes frontend/.env.local (incl. VITE_SEED_LOGIN_ENABLED=true)
 cd frontend && npm run dev
 ```
-Ad-hoc SQL against the live Aurora cluster: use `./bin/migrate.sh local --shell`
-or read the Aurora endpoint from `terraform output rds_host_external` and dial
-it with a host `psql`. The legacy `docker compose exec postgres psql` works
-only on the Community fallback path.
+Migrations are applied automatically at the end of `deploy-backend.sh` — there
+is no separate step. To re-run them manually (rare): `./bin/migrate.sh local`.
+Both invocations call the in-stack `migrate-service` Lambda; the host doesn't
+need `psql` or a TCP route to Postgres. Ad-hoc SQL still works through the
+container: `docker compose exec postgres psql -U postgres` (Community fallback)
+or open a `psql` inside the LocalStack network for Pro+Aurora.
 Open <http://localhost:3000>. Sign in with any of the four workshop personas
 using the quick-sign-in buttons on the login page (shared password
 `Workshop!2026`, seeded by `bin/seed-cognito.sh`). The buttons are gated by
@@ -51,12 +52,16 @@ docker compose down --volumes  # nuke LocalStack state (Aurora data + Cognito po
 ## AWS deployment (workshop)
 ```bash
 ./bin/setup-participant.sh             # one-time per AWS account/role
-./bin/deploy-backend.sh aws            # terraform apply (RDS, Cognito, S3, CF, Lambdas)
-./bin/migrate.sh aws                   # psql against the new Aurora cluster
+./bin/deploy-backend.sh aws            # terraform apply + auto-runs migrate.sh aws
 ./bin/seed-cognito.sh aws              # seeds the 40 @acme.org roster ONLY
 ./bin/generate-env.sh                  # writes VITE_SEED_LOGIN_ENABLED=false
 ./bin/deploy-frontend.sh aws           # vite build → s3 sync → CloudFront invalidate
 ```
+Migrations are applied inside the VPC by the `migrate-service` Lambda,
+which is invoked automatically at the end of `deploy-backend.sh aws`.
+Participants on VDIs, CloudShell, or laptops off the corporate VPN do
+**not** need a network route to Aurora — the Lambda runs alongside the
+cluster. To re-run migrations on demand: `./bin/migrate.sh aws`.
 `terraform output cloudfront_distribution_url` prints the live URL. Aurora's
 first request after idle takes 15–30 s (`min_capacity=0`) — the landing page
 shows a "warming up" indicator.

@@ -1,134 +1,130 @@
 #!/usr/bin/env bash
 # Script: Database Migration Runner
-# Purpose: Apply every backend/_db/migrations/*.sql file in lexical order.
+# Purpose: Apply every backend/_db/migrations/*.sql against Postgres by
+#          invoking the in-VPC migrate-service Lambda.
 # Usage:   ./bin/migrate.sh [aws|local]
 # Default: local
 #
-# Host has NO psql client. Migrations run via docker:
-#   - local: `docker compose exec -T postgres psql ...` against the running
-#            workshop-postgres container.
-#   - aws:   `docker run --rm postgres:17 psql ...` (ephemeral container)
-#            against the Aurora endpoint read from terraform outputs.
+# One path, both targets:
+#   - local: invokes the Lambda on LocalStack (http://localhost:4566). The
+#            Lambda runs inside the LocalStack container, on the same
+#            Docker network as workshop-postgres / LocalStack Aurora, so
+#            it can reach Postgres no matter which of those is in use.
+#   - aws:   invokes the Lambda in real AWS. The Lambda lives inside the
+#            VPC alongside Aurora, so participants don't need a route
+#            into the VPC (no VPN / SSM tunnel) to run migrations.
 #
-# Migrations are written to be idempotent (CREATE … IF NOT EXISTS, CREATE OR
-# REPLACE TRIGGER, ALTER TABLE … ADD COLUMN IF NOT EXISTS), so running this
-# repeatedly is safe.
+# The Lambda ships every backend/_db/migrations/*.sql baked into its
+# deployment package (see bin/deploy-backend.sh — the rsync step that
+# populates backend/migrate-service/_migrations/). The handler runs each
+# file in its own transaction in lex order; the SQL is idempotent
+# (CREATE … IF NOT EXISTS, ON CONFLICT DO NOTHING, …) so re-running is
+# safe.
+#
+# Requirements: aws CLI, terraform, jq. No psql/docker needed on the host.
 set -euo pipefail
 if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
     cat <<'USAGE'
 Usage: bin/migrate.sh [aws|local]
-Apply every backend/_db/migrations/*.sql file in lexical order against the
-target Postgres instance.
-  local   Local Postgres in Docker (default). Streams each SQL file into the
-          `workshop-postgres` container via `docker compose exec`.
-  aws     Reads endpoint/credentials from terraform outputs in infra/, then
-          runs psql inside an ephemeral `postgres:17` container against Aurora.
-Requirements: docker (with compose plugin). Terraform too for the aws target.
+Apply every backend/_db/migrations/*.sql against the target Postgres by
+invoking the migrate-service Lambda. The Lambda is auto-deployed by
+bin/deploy-backend.sh; this script just calls it.
+  local   LocalStack (default). Lambda runs inside LocalStack and connects
+          to whichever Postgres the stack is using (LocalStack Aurora when
+          aws_postgres_enabled=true, the workshop-postgres compose service
+          otherwise).
+  aws     Real AWS. Lambda runs inside the VPC and connects to Aurora.
+Re-running is safe — migrations are idempotent.
 USAGE
     exit 0
 fi
 echo "================================="
 echo "ACME Project Tracker - Migrations"
 echo "================================="
-command -v docker >/dev/null 2>&1 || { echo "ERROR: docker is missing"; exit 1; }
-docker info >/dev/null 2>&1 || { echo "ERROR: docker daemon is not running"; exit 1; }
+command -v aws       >/dev/null 2>&1 || { echo "ERROR: aws CLI is missing";   exit 1; }
+command -v terraform >/dev/null 2>&1 || { echo "ERROR: terraform is missing"; exit 1; }
+command -v jq        >/dev/null 2>&1 || { echo "ERROR: jq is missing";        exit 1; }
+# Silence the AWS CLI v2 output pager so JSON streams straight to stdout.
+export AWS_PAGER=""
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
-MIGRATIONS_DIR="$PROJECT_ROOT/backend/_db/migrations"
 TARGET="${1:-local}"
-shopt -s nullglob
-files=( "$MIGRATIONS_DIR"/*.sql )
-if [ ${#files[@]} -eq 0 ]; then
-    echo "WARNING: no .sql files found in $MIGRATIONS_DIR"
-    exit 0
-fi
-# run_psql_file <path-to-sql>
-# Streams the file on stdin into a psql process. The transport (compose exec
-# vs ephemeral container) is decided once per invocation based on $TARGET.
-if [ "$TARGET" = "aws" ]; then
-    command -v terraform >/dev/null 2>&1 || { echo "ERROR: terraform is missing"; exit 1; }
-    pushd "$PROJECT_ROOT/infra" >/dev/null
-    PGHOST="$(terraform output -raw rds_endpoint_external 2>/dev/null || true)"
-    PGPORT="$(terraform output -raw rds_port 2>/dev/null || echo 5432)"
-    PGDATABASE="$(terraform output -raw rds_database 2>/dev/null || echo postgres)"
-    PGUSER="$(terraform output -raw rds_username 2>/dev/null || echo superadmin)"
-    PGPASSWORD="$(terraform output -raw rds_password 2>/dev/null || true)"
-    popd >/dev/null
-    if [ -z "$PGHOST" ] || [ -z "$PGPASSWORD" ]; then
-        echo "ERROR: could not read RDS connection details from terraform outputs."
-        echo "       Make sure ./bin/deploy-backend.sh aws ran successfully."
+# Per-target environment for the AWS CLI + terraform. LocalStack needs the
+# endpoint env vars and dummy creds; real AWS uses whatever the participant
+# already has in ENVIRONMENT.config / the ambient shell.
+if [ "$TARGET" = "local" ]; then
+    export AWS_ENDPOINT_URL="http://localhost:4566"
+    # Required for Terraform ≥1.13 S3 backend reads (separate from AWS_ENDPOINT_URL).
+    export AWS_ENDPOINT_URL_S3="http://s3.localhost.localstack.cloud:4566"
+    export AWS_ACCESS_KEY_ID="test"
+    export AWS_SECRET_ACCESS_KEY="test"
+    export AWS_REGION="${AWS_REGION:-us-east-1}"
+    unset AWS_SESSION_TOKEN
+    PARTICIPANT_ID="${PARTICIPANT_ID:-abcd1234}"
+    BUCKET_NAME="coding-workshop-tfstate-${PARTICIPANT_ID}"
+elif [ "$TARGET" = "aws" ]; then
+    if [ -f "$PROJECT_ROOT/ENVIRONMENT.config" ]; then
+        # shellcheck disable=SC1091
+        source "$PROJECT_ROOT/ENVIRONMENT.config"
+    fi
+    if [ -z "${PARTICIPANT_ID:-}" ]; then
+        echo "ERROR: PARTICIPANT_ID is not set. Run bin/setup-participant.sh first."
         exit 1
     fi
-    echo "INFO: target=aws host=$PGHOST db=$PGDATABASE user=$PGUSER (psql via ephemeral postgres:17 container)"
-    run_psql_file() {
-        docker run --rm -i \
-            -e PGPASSWORD="$PGPASSWORD" \
-            postgres:17 \
-            psql --quiet --set ON_ERROR_STOP=on \
-                 -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$PGDATABASE" \
-                 < "$1"
-    }
+    BUCKET_NAME="coding-workshop-tfstate-${PARTICIPANT_ID}"
 else
-    # Local target: detect whether Aurora is deployed in LocalStack (the default
-    # when aws_postgres_enabled=true) or whether we should fall back to the plain
-    # postgres Docker container (aws_postgres_enabled=false / LocalStack Community).
-    AURORA_ENABLED=false
-    if command -v terraform >/dev/null 2>&1 && pushd "$PROJECT_ROOT/infra" >/dev/null 2>&1; then
-        # Point Terraform at LocalStack. AWS_ENDPOINT_URL_S3 is required for
-        # Terraform ≥1.13: the S3 backend uses this variable (not the generic
-        # AWS_ENDPOINT_URL) for its own state GetObject/PutObject calls.
-        _LS_ENV="AWS_ENDPOINT_URL=http://localhost:4566 AWS_ENDPOINT_URL_S3=http://s3.localhost.localstack.cloud:4566 AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_REGION=us-east-1"
-        PGHOST="$(eval "$_LS_ENV terraform output -raw rds_endpoint_external 2>/dev/null" || echo "")"
-        PGPORT="$(eval "$_LS_ENV terraform output -raw rds_port 2>/dev/null" || echo "")"
-        PGDATABASE="$(eval "$_LS_ENV terraform output -raw rds_database 2>/dev/null" || echo "")"
-        PGUSER="$(eval "$_LS_ENV terraform output -raw rds_username 2>/dev/null" || echo "")"
-        PGPASSWORD="$(eval "$_LS_ENV terraform output -raw rds_password 2>/dev/null" || echo "")"
-        popd >/dev/null 2>&1
-        [ -n "$PGHOST" ] && [ -n "$PGPASSWORD" ] && AURORA_ENABLED=true
-    fi
-
-    if [ "$AURORA_ENABLED" = true ]; then
-        # Aurora in LocalStack. Ports 4510-4559 are published to the host so
-        # we can reach LocalStack RDS at localhost:PORT from an ephemeral
-        # postgres:17 container with --network host (Linux only).
-        echo "INFO: target=local (Aurora in LocalStack) host=$PGHOST:$PGPORT db=$PGDATABASE user=$PGUSER (psql via ephemeral container)"
-        run_psql_file() {
-            docker run --rm -i \
-                --network host \
-                -e PGPASSWORD="$PGPASSWORD" \
-                postgres:17 \
-                psql --quiet --set ON_ERROR_STOP=on \
-                     -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$PGDATABASE" \
-                     < "$1"
-        }
-    else
-        # Fallback: plain postgres:17 Docker container (aws_postgres_enabled=false).
-        PGUSER="${POSTGRES_USER:-postgres}"
-        PGDATABASE="${POSTGRES_NAME:-postgres}"
-        PGPASSWORD="${POSTGRES_PASS:-postgres123}"
-        CONTAINER_NAME="workshop-postgres"
-        if ! docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
-            echo "ERROR: container ${CONTAINER_NAME} is not running."
-            echo "       Start it with: docker compose up -d postgres"
-            exit 1
-        fi
-        echo "INFO: target=local (plain Docker postgres) container=$CONTAINER_NAME db=$PGDATABASE user=$PGUSER"
-        run_psql_file() {
-            # `compose exec -T` disables TTY allocation so stdin redirection works.
-            # We pass the file on stdin; the container reads from there. PGPASSWORD
-            # is injected per-call so it never lands in `ps` listings on the host.
-            cd "$PROJECT_ROOT"
-            docker compose exec -T \
-                -e PGPASSWORD="$PGPASSWORD" \
-                postgres \
-                psql --quiet --set ON_ERROR_STOP=on \
-                     -U "$PGUSER" -d "$PGDATABASE" \
-                     < "$1"
-        }
-    fi
+    echo "ERROR: unknown target '$TARGET' (use 'local' or 'aws')"
+    exit 1
 fi
-for file in "${files[@]}"; do
-    echo "INFO: applying $(basename "$file")"
-    run_psql_file "$file"
-done
+# Resolve the Lambda function name. The shared lambda module names every
+# function "<aws_project>-<service>-<app_id>"; we read lambda_urls from
+# terraform outputs and pull out the migrate-service hostname, which IS
+# the function name on AWS. Fallback to constructing it from project +
+# participant id if the output is shaped differently (older module versions).
+pushd "$PROJECT_ROOT/infra" >/dev/null
+terraform init -reconfigure \
+    -backend-config="bucket=$BUCKET_NAME" \
+    -backend-config="region=${AWS_REGION:-us-east-1}" \
+    >/dev/null 2>&1 || true
+FN_NAME="$(terraform output -json 2>/dev/null \
+    | jq -r '.lambda_urls.value // {} | to_entries[] | select(.key == "migrate-service") | .value' \
+    | sed -E 's#https://([^.]+)\..*#\1#')"
+if [ -z "$FN_NAME" ]; then
+    AWS_PROJECT="$(terraform output -raw aws_project 2>/dev/null || echo coding-workshop)"
+    FN_NAME="${AWS_PROJECT}-migrate-service-${PARTICIPANT_ID}"
+fi
+popd >/dev/null
+echo "INFO: target=$TARGET invoking Lambda: $FN_NAME"
+OUT="$(mktemp)"
+trap 'rm -f "$OUT"' EXIT
+# raw-in-base64-out lets us pass a literal JSON payload on AWS CLI v2 without
+# base64-encoding it first. The handler ignores the payload — IAM (or
+# LocalStack's permissive auth) has already authorised the call.
+HTTP_STATUS=$(aws lambda invoke \
+    --function-name "$FN_NAME" \
+    --payload '{}' \
+    --cli-binary-format raw-in-base64-out \
+    --query 'StatusCode' --output text \
+    "$OUT")
+echo ""
+echo "INFO: Lambda response (HTTP $HTTP_STATUS):"
+if jq -e . <"$OUT" >/dev/null 2>&1; then
+    jq . <"$OUT"
+else
+    cat "$OUT"; echo
+fi
+# Handler reports logical failure inside the JSON body even when the HTTP
+# call itself succeeded — surface that as a non-zero exit.
+if jq -e '.ok == false' <"$OUT" >/dev/null 2>&1; then
+    echo ""
+    echo "ERROR: migration run reported failure — see .error and .applied above."
+    echo "       CloudWatch logs:"
+    echo "         aws logs tail /aws/lambda/$FN_NAME --follow --since 10m"
+    exit 1
+fi
+if [ "$HTTP_STATUS" != "200" ]; then
+    echo "ERROR: aws lambda invoke returned HTTP $HTTP_STATUS"
+    exit 1
+fi
+echo ""
 echo "INFO: migrations complete."

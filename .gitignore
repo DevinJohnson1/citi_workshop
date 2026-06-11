@@ -260,6 +260,10 @@ tfplan
 
 # Copied shared library inside each Lambda service (created by bin/deploy-backend.sh).
 backend/*/_lib/
+# bin/deploy-backend.sh rsyncs backend/_db/migrations/ into the migrate-service
+# Lambda package as backend/migrate-service/_migrations/ — generated artefact,
+# never edit by hand, never commit. The canonical SQL lives in backend/_db/migrations.
+backend/*/_migrations/
 
 # Vendored Python dependencies installed into each Lambda service directory by
 # `bin/start-dev.sh` (`pip install --target` inside the SAM build image) for
